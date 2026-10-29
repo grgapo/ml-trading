@@ -172,6 +172,9 @@ class ModelAgent:
                           "hold": self.strategy["max_hold"]}
         self.min_edge = float(os.environ.get("OPT_MIN_EDGE", self.bundle.get("min_edge", 0.03)))
         self.seen: set = set()        # signal bars already decided on
+        self.market = None            # set by run_session (daily history for the vol forecast)
+        self.vol_cache: dict = {}
+        self.q_low = self.bundle.get("conformal_q_low")
 
     def decide(self, symbol, bars, now, explore):
         if self.strategy:
@@ -194,6 +197,8 @@ class ModelAgent:
             self.seen.add(key)
             allowed = [1, 3] if direction > 0 else [2, 4]
             label = f"{', '.join(fired_signals(row))} {'▲' if direction > 0 else '▼'} · "
+        if "garch_vol" in self.names:
+            row["garch_vol"], row["vol_ratio"] = self._vol_today(symbol, now, float(row["close"]))
         f = row[self.names].to_numpy(dtype=float)
         if np.isnan(f).any():
             return None
@@ -207,6 +212,26 @@ class ModelAgent:
         return {"action": a, "explored": explored, "situation": f"{symbol} · {label}" + describe(row),
                 "features": [round(x, 8) for x in f.tolist()],
                 "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in allowed}}
+
+    def _vol_today(self, symbol, now, last_price):
+        """(garch_vol, vol_ratio) for today, computed once per symbol per day."""
+        import pandas as pd
+        from features import daily_vol_table
+        today = now.date()
+        hit = self.vol_cache.get(symbol)
+        if hit and hit[0] == today:
+            return hit[1]
+        val = (float("nan"), float("nan"))
+        try:
+            d = self.market.daily_bars(symbol)
+            d = d[d["ts"].dt.date < today]
+            d = pd.concat([d, pd.DataFrame({"ts": [pd.Timestamp(now)], "close": [last_price]})], ignore_index=True)
+            tab = daily_vol_table(d)
+            val = (float(tab["garch_vol"].iloc[-1]), float(tab["vol_ratio"].iloc[-1]))
+        except Exception as exc:
+            print(f"vol forecast unavailable for {symbol}: {exc}")
+        self.vol_cache[symbol] = (today, val)
+        return val
 
     def _decide_strategy(self, symbol, bars, now, explore):
         """Run the promoted champion: its bar size, signals, window, DTE, model and threshold."""
@@ -230,6 +255,12 @@ class ModelAgent:
         if direction == 0 or key in self.seen or not (lo <= row["minutes_since_open"] <= hi):
             return None
         self.seen.add(key)
+        row["garch_vol"], row["vol_ratio"] = self._vol_today(symbol, now, float(row["close"]))
+        from strategy import vol_ok
+        if not vol_ok(row["vol_ratio"], st.get("vol_filter", "off")):
+            return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: "
+                    f"{st.get('vol_filter')} days only (vol ratio {row['vol_ratio']:.2f})",
+                    "features": None, "preds": None}
         options = [a + 1 for a in allowed_actions(direction, st["dte"])]   # -> ACTIONS indices
         fired = [SIGNAL_NAMES[sg] for sg in st["signals"] if row[sg] != 0]
         label = f"{', '.join(fired)} {'▲' if direction > 0 else '▼'} · "
@@ -248,6 +279,9 @@ class ModelAgent:
             else:
                 best = max(options, key=lambda x: preds[x - 1])
                 a = best if preds[best - 1] >= (st["min_edge"] or 0.0) else 0
+                if a and self.q_low is not None and preds[a - 1] + self.q_low[a - 1] < 0:
+                    a = 0                                  # not confident enough it won't lose
+                    label += "not confident enough · "
         return {"action": a, "explored": explored, "situation": f"{symbol} · {label}" + describe(row),
                 "features": [round(x, 8) for x in f.tolist()],
                 "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in options} if preds else None}
@@ -388,6 +422,20 @@ class AlpacaMarket:
         mins = df["ts"].dt.hour * 60 + df["ts"].dt.minute
         return df[(mins >= 570) & (mins < 960)].reset_index(drop=True)
 
+    def daily_bars(self, symbol: str):
+        """About 3 years of daily closes (for the GARCH volatility forecast)."""
+        import pandas as pd
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
+                               start=self.now() - dt.timedelta(days=1100), feed=DataFeed.IEX)
+        raw = self.stocks.get_stock_bars(req).data.get(symbol, [])
+        df = pd.DataFrame({"ts": [b.timestamp for b in raw], "close": [float(b.close) for b in raw]})
+        if len(df):
+            df["ts"] = pd.to_datetime(df["ts"]).dt.tz_convert(NY)
+        return df
+
     def pick_contract(self, symbol: str, kind: str, expiry: dt.date, spot: float) -> str | None:
         from alpaca.trading.enums import ContractType
         from alpaca.trading.requests import GetOptionContractsRequest
@@ -473,6 +521,16 @@ class SimMarket:
         df["ts"] = df["ts"].dt.tz_convert(NY)
         return df
 
+    def daily_bars(self, symbol: str):
+        import pandas as pd
+        rng = random.Random(len(symbol))
+        days = pd.bdate_range(end=self.t.date() - dt.timedelta(days=1), periods=700)
+        px, closes = self.px[symbol], []
+        for _ in days:
+            px *= math.exp(rng.gauss(0, 0.011))
+            closes.append(px)
+        return pd.DataFrame({"ts": pd.to_datetime(days).tz_localize(NY), "close": closes})
+
     def pick_contract(self, symbol, kind, expiry, spot):
         return f"{symbol}{expiry:%y%m%d}{kind[0].upper()}{round(spot)}"
 
@@ -557,6 +615,7 @@ def run_session(market, agent: Agent, explore: float) -> dict:
            "stopped": None, "open": None, "last_decision": None}
     turn = 0
 
+    agent.market = market
     agent_stats = agent.stats()
 
     def status(phase):

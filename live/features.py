@@ -16,7 +16,10 @@ FEATURES = [
     # signal context (meta-labeling): which setup fired, its direction, and its shape
     "price_vs_ema50", "ema50_slope", "or_size_pct", "or_pos",
     "sig_vwap", "sig_ema50", "sig_orb", "sig_fvg", "signal_dir",
+    # daily volatility regime (GARCH forecast for today vs recent realized volatility)
+    "garch_vol", "vol_ratio",
 ]
+FEATURE_VERSION = 2   # bump when inputs change, so cached practice data is rebuilt
 SIGNALS = ["sig_vwap", "sig_ema50", "sig_orb", "sig_fvg"]
 SIGNAL_NAMES = {"sig_vwap": "VWAP cross", "sig_ema50": "50 EMA cross",
                 "sig_orb": "opening-range breakout", "sig_fvg": "FVG retest"}
@@ -170,6 +173,46 @@ def direction_from(row_or_df, allowed: list[str]):
     """Signal direction using only the chosen setups (+1, -1, 0; conflicts cancel)."""
     total = sum(row_or_df[sg] for sg in allowed)
     return np.sign(total)
+
+
+def daily_vol_table(bars: pd.DataFrame, refit_every: int = 21) -> pd.DataFrame:
+    """Per trading day: GARCH(1,1) forecast of today's volatility made with data up to
+    YESTERDAY's close, plus 20-day realized volatility. Annualized, as fractions.
+    Parameters are refit monthly on past data only (walk-forward, no look-ahead).
+    Falls back to an EWMA (RiskMetrics) forecast when arch is missing or history is short."""
+    daily = bars.assign(date=bars["ts"].dt.date).groupby("date")["close"].last()
+    r = np.log(daily).diff().dropna()
+    out = pd.DataFrame(index=daily.index)
+    rv20 = r.rolling(20, min_periods=10).std() * np.sqrt(252)
+    out["rv20"] = rv20.shift(1)                                  # known before today's open
+    ewma_var = (r ** 2).ewm(alpha=0.06, adjust=False).mean()    # lambda = 0.94
+    out["garch_vol"] = (np.sqrt(ewma_var) * np.sqrt(252)).shift(1)
+    try:
+        from arch import arch_model
+        pct = r * 100
+        vols = pd.Series(np.nan, index=pct.index)
+        for start in range(250, len(pct), refit_every):
+            fit = arch_model(pct.iloc[:start], vol="GARCH", p=1, q=1, mean="Constant",
+                             rescale=False).fit(disp="off")
+            fixed = arch_model(pct.iloc[:start + refit_every], vol="GARCH", p=1, q=1,
+                               mean="Constant", rescale=False).fix(fit.params)
+            # one-step-ahead variance for day t+1 from returns up to day t
+            f = fixed.forecast(horizon=1, start=start - 1, reindex=True).variance["h.1"]
+            nxt = np.sqrt(f.shift(1)) * np.sqrt(252) / 100
+            seg = nxt.iloc[start:start + refit_every]
+            vols.loc[seg.index] = seg.to_numpy()
+        out.loc[vols.dropna().index, "garch_vol"] = vols.dropna()
+    except ImportError:
+        pass
+    out["vol_ratio"] = out["garch_vol"] / out["rv20"]
+    return out[["garch_vol", "vol_ratio"]]
+
+
+def attach_daily_vol(df: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
+    """Add each bar's day-level volatility forecast (same value for the whole day)."""
+    for col in ("garch_vol", "vol_ratio"):
+        df[col] = df["date"].map(table[col]).astype(float)
+    return df
 
 
 def fired_signals(row) -> list[str]:

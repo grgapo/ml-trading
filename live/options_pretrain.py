@@ -36,7 +36,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from features import FEATURES, SIGNAL_NAMES, SIGNALS, add_indicators  # noqa: E402
+from features import (FEATURES, SIGNAL_NAMES, SIGNALS, add_indicators, attach_daily_vol,  # noqa: E402
+                      daily_vol_table)
 
 NY = ZoneInfo("America/New_York")
 ACTIONS = ["skip", "call_1dte", "put_1dte", "call_0dte", "put_0dte"]
@@ -360,7 +361,7 @@ def main() -> int:
                     write_status(symbol=symbol, epoch=s_i * len(months) + m_i, epochs=len(symbols) * len(months))
                     parts.append(download_month(symbol, y, m))
                 raw = pd.concat(parts, ignore_index=True)
-            frames[symbol] = add_indicators(raw, symbol)
+            frames[symbol] = attach_daily_vol(add_indicators(raw, symbol), daily_vol_table(raw))
         write_status(phase="simulating trades", epoch=0)
         data = build_dataset(frames)
         if len(data["X"]) < 1000:

@@ -27,11 +27,11 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from features import FEATURES, SIGNALS, add_indicators, resample  # noqa: E402
+from features import FEATURES, SIGNALS, add_indicators, attach_daily_vol, daily_vol_table, resample  # noqa: E402
 from options_pretrain import (DAILY_BUDGET, DATA_DIR, EMBARGO_DAYS, MODEL_PATH, NY, STATE_DIR,  # noqa: E402
                               build_dataset, download_month, fit_models, month_list, predict,
                               synthetic_bars, trade_month)
-from strategy import SIGNAL_SETS, SPACE, WINDOWS, allowed_actions, dataset_key, describe  # noqa: E402
+from strategy import SIGNAL_SETS, SPACE, VOL_SPLIT, WINDOWS, allowed_actions, dataset_key, describe  # noqa: E402
 
 SEARCH_DIR = STATE_DIR / "search"
 CACHE_DIR = DATA_DIR.parent / "search_cache"
@@ -85,7 +85,8 @@ def dataset_for(p: dict, raw: dict, memo: dict) -> dict:
     if path.exists():
         data = dict(np.load(path))
     else:
-        frames = {s: add_indicators(resample(df, p["bar_minutes"]), s) for s, df in raw.items()}
+        frames = {s: attach_daily_vol(add_indicators(resample(df, p["bar_minutes"]), s), daily_vol_table(df))
+                  for s, df in raw.items()}
         data = build_dataset(frames, p["stop_loss"], p["take_profit"], p["max_hold"], progress=False)
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **data)
@@ -102,7 +103,24 @@ def qualify(data: dict, p: dict) -> tuple[np.ndarray, np.ndarray]:
     lo, hi = WINDOWS[p["window"]]
     m = X[:, COL["minutes_since_open"]]
     ok = (direction != 0) & (m >= lo) & (m <= hi)
+    vf = p.get("vol_filter", "off")
+    if vf not in (None, "off"):
+        vr = X[:, COL["vol_ratio"]]
+        ok &= (vr <= VOL_SPLIT) if vf == "calm" else (vr > VOL_SPLIT)
     return ok, direction
+
+
+def fit_with_confidence(X: np.ndarray, R: np.ndarray, confidence) -> tuple[list, np.ndarray | None]:
+    """Split-conformal prediction (what MAPIE implements): fit on the older 80% of the
+    rows, measure how far real outcomes fell below the predictions on the newest 20%,
+    and keep that shortfall at the chosen confidence. lower bound = prediction + shortfall."""
+    if confidence in (None, "off") or len(X) < 500:
+        return fit_models(X, R), None
+    cut = int(len(X) * 0.8)
+    models = fit_models(X[:cut], R[:cut])
+    resid = R[cut:] - predict(models, X[cut:])
+    q_low = np.quantile(resid, 1 - float(confidence), axis=0)
+    return models, q_low
 
 
 # ---- grading ---------------------------------------------------------------------------
@@ -113,22 +131,26 @@ def run_folds(data: dict, p: dict, folds: list[tuple[np.ndarray, np.ndarray]]) -
         test_rows = test_rows[ok[test_rows]]
         if len(test_rows) == 0:
             continue
-        preds = None
+        preds, q_low = None, None
         if p["use_model"]:
             tr = train_mask & ok
             if tr.sum() < 300:
                 continue                               # not enough history yet for a model
-            models = fit_models(data["X"][tr], data["R"][tr])
+            models, q_low = fit_with_confidence(data["X"][tr], data["R"][tr], p.get("confidence", "off"))
             preds = dict(zip(test_rows, predict(models, data["X"][test_rows])))
 
-        def choose(r, preds=preds):
+        def choose(r, preds=preds, q_low=q_low):
             options = allowed_actions(direction[r], p["dte"])
             if not options:
                 return None
             if preds is None:
                 return options[0]
             a = max(options, key=lambda x: preds[r][x])
-            return a if preds[r][a] >= p["min_edge"] else None
+            if preds[r][a] < p["min_edge"]:
+                return None
+            if q_low is not None and preds[r][a] + q_low[a] < 0:
+                return None                            # not sure enough it won't lose
+            return a
 
         res = trade_month(data, test_rows, choose)
         for k in tot:
@@ -171,6 +193,7 @@ def sample(rng: random.Random) -> dict:
     p["signals"] = rng.choice(SIGNAL_SETS)
     if not p["use_model"]:
         p["min_edge"] = None
+        p["confidence"] = "off"
     return p
 
 
@@ -194,11 +217,13 @@ def promote(entry: dict, raw: dict, memo: dict, champion: dict) -> None:
     p = entry["params"]
     data = dataset_for(p, raw, memo)
     ok, _ = qualify(data, p)
-    models = fit_models(data["X"][ok], data["R"][ok]) if p["use_model"] else None
+    models, q_low = (fit_with_confidence(data["X"][ok], data["R"][ok], p.get("confidence", "off"))
+                     if p["use_model"] else (None, None))
     bundle = {"models": models, "features": FEATURES, "strategy": p, "signal_mode": True, "version": 3,
               "min_edge": p["min_edge"] if p["use_model"] else 0.0, "dataset_key": dataset_key(p),
               "dataset_path": str(CACHE_DIR / f"{dataset_key(p)}.npz"),
               "decisions": int(ok.sum()), "description": entry["desc"],
+              "conformal_q_low": q_low.tolist() if q_low is not None else None,
               "trained_from": str(pd.Timestamp(data["ts"][0], tz="UTC").tz_convert(NY).date()),
               "trained_to": str(pd.Timestamp(data["ts"][-1], tz="UTC").tz_convert(NY).date()),
               "walk_forward": {"model": entry["holdout"], "search": entry["search"]},
