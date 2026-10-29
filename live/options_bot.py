@@ -30,9 +30,12 @@ import math
 import os
 import random
 import time
+import sys
 import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 NY = ZoneInfo("America/New_York")
 
@@ -49,7 +52,9 @@ CHECK_EVERY_S = int(os.environ.get("OPT_CHECK_EVERY_S", "60"))
 FIRST_ENTRY = os.environ.get("OPT_FIRST_ENTRY", "09:45")         # skip the opening chaos
 LAST_ENTRY = os.environ.get("OPT_LAST_ENTRY", "15:00")
 FLATTEN_AT = os.environ.get("OPT_FLATTEN_AT", "15:45")           # close everything
-EXPLORATION = float(os.environ.get("OPT_EXPLORATION", "0.25"))
+EXPLORATION = float(os.environ.get("OPT_EXPLORATION", "0.25"))          # table agent (no model yet)
+MODEL_EXPLORATION = float(os.environ.get("OPT_MODEL_EXPLORATION", "0.10"))  # once pre-trained
+LIVE_WEIGHT = float(os.environ.get("OPT_LIVE_WEIGHT", "5"))  # a real paper trade counts 5x a simulated one
 REPLAY_SWEEPS = int(os.environ.get("OPT_REPLAY_SWEEPS", "20000"))
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path.home() / "projects" / "paper-state"))
 
@@ -110,11 +115,30 @@ class Agent:
             q, _ = self._row(state)
             q[action] += 0.01 * (reward - q[action])
 
+    # Same interface as ModelAgent.
+    mode = "table"
+
+    def decide(self, symbol, bars, now, explore):
+        closes = bars["close"].tolist()
+        if len(closes) < 30:
+            return None
+        sit = situation(symbol, closes, now)
+        a, explored = self.choose(sit, list(range(len(ACTIONS))), explore)
+        return {"action": a, "explored": explored, "situation": sit, "features": None, "preds": None}
+
+    def learn_trade(self, trade: dict, reward: float, date: str) -> None:
+        self.learn(trade["situation"], ACTIONS.index(trade["action"]), reward, date)
+
+    def overnight(self) -> None:
+        self.replay(REPLAY_SWEEPS)
+        self.save()
+
     def stats(self) -> dict:
         by_action = {}
         for _, a, r, _ in self.memory:
             by_action.setdefault(ACTIONS[a], []).append(r)
         return {
+            "mode": "table (no pre-training yet)",
             "trades_learned": len(self.memory),
             "situations_seen": len(self.q),
             "avg_by_action": {k: round(sum(v) / len(v), 4) for k, v in by_action.items()},
@@ -126,6 +150,106 @@ class Agent:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"q": self.q, "n": self.n, "memory": self.memory}))
         tmp.replace(self.path)
+
+
+class ModelAgent:
+    """Pre-trained model (live/options_pretrain.py): predicts each trade's return
+    from the indicators, takes the best one if it clears MIN_EDGE, and retrains
+    every night on history + its own paper trades (weighted LIVE_WEIGHT x)."""
+
+    mode = "model"
+
+    def __init__(self, model_path: Path, live_path: Path):
+        import joblib
+        self.model_path, self.live_path = model_path, live_path
+        self.bundle = joblib.load(model_path)
+        self.models = self.bundle["models"]
+        self.min_edge = float(os.environ.get("OPT_MIN_EDGE", self.bundle.get("min_edge", 0.03)))
+
+    def decide(self, symbol, bars, now, explore):
+        import numpy as np
+        from features import FEATURES, add_indicators, describe
+        df = add_indicators(bars, symbol)
+        if len(df) < 60:
+            return None
+        row = df.iloc[-1].copy()
+        if pd_isna(row["day_gap"]):
+            row["day_gap"] = 0.0
+        f = row[FEATURES].to_numpy(dtype=float)
+        if np.isnan(f).any():
+            return None
+        preds = [float(m.predict(f.reshape(1, -1))[0]) for m in self.models]
+        best = int(np.argmax(preds))
+        explored = random.random() < explore
+        if explored:
+            a = random.randrange(4) + 1
+        else:
+            a = best + 1 if preds[best] >= self.min_edge else 0
+        return {"action": a, "explored": explored, "situation": f"{symbol} · " + describe(row),
+                "features": [round(x, 8) for x in f.tolist()],
+                "preds": {ACTIONS[i + 1]: round(p, 4) for i, p in enumerate(preds)}}
+
+    def learn_trade(self, trade: dict, reward: float, date: str) -> None:
+        new = not self.live_path.exists()
+        with self.live_path.open("a", newline="") as fh:
+            w = csv.writer(fh)
+            if new:
+                w.writerow(["date", "action", "reward", "features"])
+            w.writerow([date, trade["action"], round(reward, 4), json.dumps(trade["features"])])
+
+    def _live_rows(self):
+        if not self.live_path.exists():
+            return []
+        with self.live_path.open() as fh:
+            return list(csv.DictReader(fh))
+
+    def overnight(self) -> None:
+        """Retrain on simulated history + real paper trades."""
+        import joblib
+        import numpy as np
+        from options_pretrain import DATASET_PATH, fit_models
+        live = self._live_rows()
+        if not live or not DATASET_PATH.exists():
+            return
+        data = np.load(DATASET_PATH)
+        X, R = data["X"], data["R"]
+        LX = np.array([json.loads(r["features"]) for r in live])
+        # A live trade only reveals the outcome of the action actually taken: use the
+        # model's current prediction for the other actions so they are left unchanged.
+        LR = np.column_stack([m.predict(LX) for m in self.models])
+        for k, r in enumerate(live):
+            LR[k, ACTIONS.index(r["action"]) - 1] = float(r["reward"])
+        Xall, Rall = np.vstack([X, LX]), np.vstack([R, LR])
+        w = np.concatenate([np.ones(len(X)), np.full(len(LX), LIVE_WEIGHT)])
+        self.models = fit_models(Xall, Rall, w)
+        self.bundle.update(models=self.models, live_trades=len(live),
+                           retrained=dt.datetime.now(NY).isoformat(timespec="seconds"))
+        tmp = self.model_path.with_suffix(".tmp")
+        joblib.dump(self.bundle, tmp)
+        tmp.replace(self.model_path)
+
+    def stats(self) -> dict:
+        live = self._live_rows()
+        by_action = {}
+        for r in live:
+            by_action.setdefault(r["action"], []).append(float(r["reward"]))
+        wf = self.bundle.get("walk_forward", {})
+        m = wf.get("model", {})
+        return {
+            "mode": "pre-trained model",
+            "trades_learned": len(live),
+            "avg_by_action": {k: round(sum(v) / len(v), 4) for k, v in by_action.items()},
+            "count_by_action": {k: len(v) for k, v in by_action.items()},
+            "model": {"trained": f"{self.bundle.get('trained_from')} → {self.bundle.get('trained_to')}",
+                      "simulated_decisions": self.bundle.get("decisions"),
+                      "walk_forward_pnl": m.get("pnl"), "walk_forward_trades": m.get("trades"),
+                      "walk_forward_green_days": f"{m.get('green_days')}/{m.get('days')}",
+                      "synthetic": self.bundle.get("synthetic", False)},
+        }
+
+
+def pd_isna(x) -> bool:
+    return x is None or (isinstance(x, float) and math.isnan(x))
 
 
 def situation(symbol: str, closes: list[float], now: dt.datetime) -> str:
@@ -176,14 +300,23 @@ class AlpacaMarket:
             start=today + dt.timedelta(days=1), end=today + dt.timedelta(days=10)))
         return days[0].date
 
-    def closes(self, symbol: str) -> list[float]:
+    def bars(self, symbol: str):
+        """Regular-session 1-minute bars for roughly the last 3 sessions (indicator warm-up)."""
+        import pandas as pd
         from alpaca.data.enums import DataFeed
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
         req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute,
-                               start=self.now() - dt.timedelta(minutes=90), feed=DataFeed.IEX)
-        bars = self.stocks.get_stock_bars(req).data.get(symbol, [])
-        return [float(b.close) for b in bars]
+                               start=self.now() - dt.timedelta(days=5), feed=DataFeed.IEX)
+        raw = self.stocks.get_stock_bars(req).data.get(symbol, [])
+        df = pd.DataFrame({"ts": [b.timestamp for b in raw], "open": [float(b.open) for b in raw],
+                           "high": [float(b.high) for b in raw], "low": [float(b.low) for b in raw],
+                           "close": [float(b.close) for b in raw], "volume": [float(b.volume) for b in raw]})
+        if df.empty:
+            return df
+        df["ts"] = pd.to_datetime(df["ts"]).dt.tz_convert(NY)
+        mins = df["ts"].dt.hour * 60 + df["ts"].dt.minute
+        return df[(mins >= 570) & (mins < 960)].reset_index(drop=True)
 
     def pick_contract(self, symbol: str, kind: str, expiry: dt.date, spot: float) -> str | None:
         from alpaca.trading.enums import ContractType
@@ -236,7 +369,8 @@ class SimMarket:
         self.rng = random.Random(seed or date.toordinal())
         self.t = dt.datetime.combine(date, dt.time(9, 30), NY)
         self.px = {s: 100.0 * (i + 5) for i, s in enumerate(SYMBOLS)}
-        self.hist = {s: [p] * 40 for s, p in self.px.items()}
+        self.hist = {s: [p * math.exp(self.rng.gauss(0, 0.0007) * k ** 0.5) for k in range(400, 0, -1)]
+                     for s, p in self.px.items()}
         self.pos: dict[str, dict] = {}
 
     def now(self) -> dt.datetime:
@@ -259,8 +393,15 @@ class SimMarket:
             d += dt.timedelta(days=1)
         return d
 
-    def closes(self, symbol: str) -> list[float]:
-        return self.hist[symbol][-90:]
+    def bars(self, symbol: str):
+        import pandas as pd
+        closes = self.hist[symbol][-1200:]
+        n = len(closes)
+        ts = [self.t - dt.timedelta(minutes=n - 1 - k) for k in range(n)]
+        df = pd.DataFrame({"ts": pd.to_datetime(ts), "open": closes, "high": [c * 1.0002 for c in closes],
+                           "low": [c * 0.9998 for c in closes], "close": closes, "volume": [1000.0] * n})
+        df["ts"] = df["ts"].dt.tz_convert(NY)
+        return df
 
     def pick_contract(self, symbol, kind, expiry, spot):
         return f"{symbol}{expiry:%y%m%d}{kind[0].upper()}{round(spot)}"
@@ -345,10 +486,13 @@ def run_session(market, agent: Agent, explore: float) -> dict:
            "stopped": None, "open": None, "last_decision": None}
     turn = 0
 
+    agent_stats = agent.stats()
+
     def status(phase):
+        open_t = {k: v for k, v in (day["open"] or {}).items() if k != "features"} or None
         write_status(phase=phase, session=str(today), max_trades=MAX_TRADES, win_target=WIN_TARGET,
-                     budget=DAILY_BUDGET, **{k: v for k, v in day.items() if k != "date"},
-                     agent=agent.stats())
+                     budget=DAILY_BUDGET, **{k: v for k, v in day.items() if k not in ("date", "open")},
+                     open=open_t, agent=agent_stats)
 
     while market.now() < open_t:
         status("waiting for the open")
@@ -375,7 +519,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                 if reason:
                     market.close(t["contract"])
                     reward = max(-1.0, min(1.0, pos["plpc"]))
-                    agent.learn(t["situation"], ACTIONS.index(t["action"]), reward, str(today))
+                    agent.learn_trade(t, reward, str(today))
+                    agent_stats.update(agent.stats())
                     day["trades"] += 1
                     day["wins"] += pos["pl"] > 0
                     day["pl_usd"] = round(day["pl_usd"] + pos["pl"], 2)
@@ -389,7 +534,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                         day["stopped"] = f"hit {WIN_TARGET} winners"
                     elif day["trades"] >= MAX_TRADES:
                         day["stopped"] = f"used all {MAX_TRADES} trades"
-                    agent.save()
+                    if agent.mode == "table":
+                        agent.save()
                 status("in a trade" if day["open"] else "watching")
         elif day["stopped"] is None:                     # maybe open a trade
             paused = (STATE_DIR / "options.PAUSE").exists()
@@ -405,13 +551,14 @@ def run_session(market, agent: Agent, explore: float) -> dict:
             else:
                 symbol = SYMBOLS[turn % len(SYMBOLS)]
                 turn += 1
-                closes = market.closes(symbol)
-                if len(closes) >= 30:
-                    sit = situation(symbol, closes, now)
-                    action_i, explored = agent.choose(sit, list(range(len(ACTIONS))), explore)
-                    action = ACTIONS[action_i]
+                bars = market.bars(symbol)
+                d = agent.decide(symbol, bars, now, explore) if len(bars) else None
+                if d:
+                    closes = bars["close"].tolist()
+                    sit, explored = d["situation"], d["explored"]
+                    action = ACTIONS[d["action"]]
                     day["last_decision"] = {"time": now.isoformat(timespec="seconds"), "situation": sit,
-                                            "action": action, "explored": explored}
+                                            "action": action, "explored": explored, "preds": d["preds"]}
                     if action != "skip":
                         kind, dte = action.split("_")
                         contract = market.pick_contract(symbol, kind, expiry[dte], closes[-1])
@@ -422,7 +569,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                             day["spent"] = round(day["spent"] + qty * price * 100, 2)
                             day["open"] = {"symbol": symbol, "contract": contract, "action": action, "qty": qty,
                                            "opened": now.isoformat(timespec="seconds"), "situation": sit,
-                                           "explored": explored, "plpc": 0.0, "pl_usd": 0.0}
+                                           "features": d["features"], "explored": explored,
+                                           "plpc": 0.0, "pl_usd": 0.0}
                         else:
                             day["last_decision"]["note"] = "too expensive or no contract"
                 status("in a trade" if day["open"] else "watching")
@@ -437,8 +585,7 @@ def run_session(market, agent: Agent, explore: float) -> dict:
         day["open"] = None
 
     status("training overnight")
-    agent.replay(REPLAY_SWEEPS)
-    agent.save()
+    agent.overnight()
     summary = (f"{today}: {day['trades']} trades, {day['wins']} winners, "
                f"P&L ${day['pl_usd']:+,.0f}, spent ${day['spent']:,.0f}"
                + (f" (stopped: {day['stopped']})" if day["stopped"] else ""))
@@ -453,10 +600,17 @@ def main() -> int:
     ap.add_argument("--simulate", action="store_true", help="fake market and fast clock")
     ap.add_argument("--date", default="2026-10-29", help="date for --simulate")
     args = ap.parse_args()
-    agent = Agent(STATE_DIR / "options_agent.json")
+    model_path = STATE_DIR / "options_model.joblib"
+    if model_path.exists():
+        agent = ModelAgent(model_path, STATE_DIR / "options_live.csv")
+        explore = MODEL_EXPLORATION
+    else:
+        agent = Agent(STATE_DIR / "options_agent.json")
+        explore = EXPLORATION
+    print(f"agent: {agent.mode}, exploration {explore:.0%}")
     market = SimMarket(dt.date.fromisoformat(args.date)) if args.simulate else AlpacaMarket()
     try:
-        run_session(market, agent, EXPLORATION)
+        run_session(market, agent, explore)
     except Exception as exc:
         write_status(phase="failed", error=f"{type(exc).__name__}: {exc}", agent=agent.stats())
         notify(f"Options bot failed: {exc}", priority=5)
