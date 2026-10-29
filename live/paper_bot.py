@@ -76,10 +76,47 @@ def load_prices(symbol: str, csv_path: str | None = None) -> pd.DataFrame:
     return df
 
 
+# ---- live status (read by the lab control app) ----------------------------------
+RUN = {"started": None, "symbols": SYMBOLS, "done": []}
+
+
+def write_status(phase: str, **info) -> None:
+    """Atomically write STATE_DIR/status.json so the app can show progress."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"phase": phase, "updated": dt.datetime.now(NY).isoformat(timespec="seconds"),
+            "started": RUN["started"], "symbols": RUN["symbols"], "done": RUN["done"], **info}
+    tmp = STATE_DIR / "status.json.tmp"
+    tmp.write_text(json.dumps(data))
+    tmp.replace(STATE_DIR / "status.json")
+
+
+class ProgressDynaQ(dyna_q.DynaQ):
+    """Friend's DynaQ, unchanged, plus a progress report every few epochs.
+
+    train() asks for the exploration rate at the start of every epoch, so that
+    hook tells us which epoch is running without touching the training code.
+    """
+    symbol = "?"
+    _t0 = None
+
+    def exploration_rate(self, epoch: int) -> float:
+        import time
+        if epoch == 0 or self._t0 is None:
+            self._t0 = time.time()
+        if epoch % 10 == 0 or epoch == self.epochs - 1:
+            elapsed = time.time() - self._t0
+            per_epoch = elapsed / epoch if epoch else None
+            write_status("pre-training", symbol=self.symbol, epoch=epoch, epochs=self.epochs,
+                         seconds_left=round(per_epoch * (self.epochs - epoch)) if per_epoch else None)
+        return super().exploration_rate(epoch)
+
+
 # ---- agent persistence --------------------------------------------------------
-def new_agent(df: pd.DataFrame) -> "dyna_q.DynaQ":
-    return dyna_q.DynaQ(df, alpha=ALPHA, planning_steps=PLANNING_STEPS,
-                        epochs=PRETRAIN_EPOCHS)
+def new_agent(df: pd.DataFrame, symbol: str = "?") -> "dyna_q.DynaQ":
+    agent = ProgressDynaQ(df, alpha=ALPHA, planning_steps=PLANNING_STEPS,
+                          epochs=PRETRAIN_EPOCHS)
+    agent.symbol = symbol
+    return agent
 
 
 def save_agent(agent, symbol: str, extra: dict) -> None:
@@ -179,13 +216,14 @@ class DryRunBroker:
 
 # ---- one symbol, one day ------------------------------------------------------
 def step_symbol(symbol: str, broker, today: dt.date, csv_path: str | None) -> dict:
+    write_status("downloading prices", symbol=symbol)
     df = load_prices(symbol, csv_path)
     df = df[df["Date"] <= pd.Timestamp(today)].reset_index(drop=True)
     if df["Date"].iloc[-1].date() != today:
         raise RuntimeError(f"{symbol}: today's close not available yet "
                            f"(latest {df['Date'].iloc[-1].date()})")
     t = len(df) - 1
-    agent = new_agent(df)                       # adds Price_to_SMA_Ratio to df
+    agent = new_agent(df, symbol)               # adds Price_to_SMA_Ratio to df
     state = load_agent(agent, symbol)
 
     if state is None:                           # first run: learn from history
@@ -197,6 +235,7 @@ def step_symbol(symbol: str, broker, today: dt.date, csv_path: str | None) -> di
         return {"symbol": symbol, "skipped": "already ran today"}
     else:
         # Learn from the decision made at the previous run.
+        write_status("learning from yesterday", symbol=symbol)
         prev_t = int(np.flatnonzero(df["Date"] == pd.Timestamp(state["last_date"]))[0])
         pos = int(state["position_after"])
         ret = float(df["Adj Close"].iloc[t] / df["Adj Close"].iloc[prev_t] - 1.0)
@@ -211,6 +250,7 @@ def step_symbol(symbol: str, broker, today: dt.date, csv_path: str | None) -> di
         learned = f"reward {reward:+.4%}"
 
     # Decide today's action from the broker's real position.
+    write_status("deciding + ordering", symbol=symbol)
     held = broker.shares(symbol)
     position = LONG if held > 0 else FLAT
     bin_now = agent.market_bin(t)
@@ -272,15 +312,19 @@ def main() -> int:
     args = ap.parse_args()
 
     today = dt.date.fromisoformat(args.date) if args.date else dt.datetime.now(NY).date()
+    RUN["started"] = dt.datetime.now(NY).isoformat(timespec="seconds")
+    write_status("starting", session=str(today), dry_run=args.dry_run)
     broker = DryRunBroker() if args.dry_run else Broker()
     if not broker.traded_today(today):
         print(f"{today}: market closed, nothing to do")
+        write_status("idle", result=f"{today}: market closed")
         return 0
 
     rows, failures = [], []
     for symbol in SYMBOLS:
         try:
             rows.append(step_symbol(symbol, broker, today, args.csv))
+            RUN["done"].append(symbol)
         except Exception as exc:
             failures.append(f"{symbol}: {exc}")
     equity = broker.equity()
@@ -290,6 +334,7 @@ def main() -> int:
              for r in rows] + [f"FAILED {f}" for f in failures]
     summary = f"{today} equity ${equity:,.0f}\n" + "\n".join(lines)
     print(summary)
+    write_status("failed" if failures else "idle", session=str(today), result=summary)
     notify(summary, priority=5 if failures else 3)
     return 1 if failures else 0
 
