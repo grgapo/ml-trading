@@ -166,10 +166,16 @@ class ModelAgent:
         self.models = self.bundle["models"]
         self.names = self.bundle["features"]
         self.signal_mode = bool(self.bundle.get("signal_mode"))
+        self.strategy = self.bundle.get("strategy")     # set when the nightly search promoted a champion
+        if self.strategy:
+            self.exits = {"sl": self.strategy["stop_loss"], "tp": self.strategy["take_profit"],
+                          "hold": self.strategy["max_hold"]}
         self.min_edge = float(os.environ.get("OPT_MIN_EDGE", self.bundle.get("min_edge", 0.03)))
         self.seen: set = set()        # signal bars already decided on
 
     def decide(self, symbol, bars, now, explore):
+        if self.strategy:
+            return self._decide_strategy(symbol, bars, now, explore)
         import numpy as np
         from features import add_indicators, describe, fired_signals
         df = add_indicators(bars, symbol)
@@ -202,6 +208,50 @@ class ModelAgent:
                 "features": [round(x, 8) for x in f.tolist()],
                 "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in allowed}}
 
+    def _decide_strategy(self, symbol, bars, now, explore):
+        """Run the promoted champion: its bar size, signals, window, DTE, model and threshold."""
+        import numpy as np
+        from features import SIGNAL_NAMES, add_indicators, describe, direction_from, resample
+        from strategy import WINDOWS, allowed_actions
+        st = self.strategy
+        b = resample(bars, st["bar_minutes"])
+        if st["bar_minutes"] > 1 and len(b):          # drop the bar that is still forming
+            last_1m = bars["ts"].iloc[-1]
+            b = b[b["ts"] + dt.timedelta(minutes=st["bar_minutes"] - 1) <= last_1m].reset_index(drop=True)
+        df = add_indicators(b, symbol)
+        if len(df) < 30:
+            return None
+        row = df.iloc[-1].copy()
+        if pd_isna(row["day_gap"]):
+            row["day_gap"] = 0.0
+        direction = int(direction_from(row, st["signals"]))
+        lo, hi = WINDOWS[st["window"]]
+        key = (symbol, str(row["ts"]))
+        if direction == 0 or key in self.seen or not (lo <= row["minutes_since_open"] <= hi):
+            return None
+        self.seen.add(key)
+        options = [a + 1 for a in allowed_actions(direction, st["dte"])]   # -> ACTIONS indices
+        fired = [SIGNAL_NAMES[sg] for sg in st["signals"] if row[sg] != 0]
+        label = f"{', '.join(fired)} {'▲' if direction > 0 else '▼'} · "
+        f = row[self.names].to_numpy(dtype=float)
+        if np.isnan(f).any():
+            return None
+        preds = None
+        explored = False
+        if self.models is None:                        # champion = take every signal
+            a = options[0]
+        else:
+            preds = [float(m.predict(f.reshape(1, -1))[0]) for m in self.models]
+            explored = random.random() < explore
+            if explored:
+                a = random.choice(options)
+            else:
+                best = max(options, key=lambda x: preds[x - 1])
+                a = best if preds[best - 1] >= (st["min_edge"] or 0.0) else 0
+        return {"action": a, "explored": explored, "situation": f"{symbol} · {label}" + describe(row),
+                "features": [round(x, 8) for x in f.tolist()],
+                "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in options} if preds else None}
+
     def learn_trade(self, trade: dict, reward: float, date: str) -> None:
         new = not self.live_path.exists()
         with self.live_path.open("a", newline="") as fh:
@@ -222,10 +272,17 @@ class ModelAgent:
         import numpy as np
         from options_pretrain import DATASET_PATH, fit_models
         live = self._live_rows()
-        if not live or not DATASET_PATH.exists():
+        if self.strategy and self.models is None:
+            return                                     # take-every-signal champion: nothing to fit
+        path = Path(self.bundle.get("dataset_path") or DATASET_PATH)
+        if not live or not path.exists():
             return
-        data = np.load(DATASET_PATH)
+        data = np.load(path)
         X, R = data["X"], data["R"]
+        if self.strategy:                              # same rows the champion was trained on
+            from options_search import qualify
+            ok, _ = qualify({"X": X}, self.strategy)
+            X, R = X[ok], R[ok]
         LX = np.array([json.loads(r["features"]) for r in live])
         # A live trade only reveals the outcome of the action actually taken: use the
         # model's current prediction for the other actions so they are left unchanged.
@@ -249,7 +306,7 @@ class ModelAgent:
         wf = self.bundle.get("walk_forward", {})
         m = wf.get("model", {})
         return {
-            "mode": "pre-trained model",
+            "mode": ("search champion: " + self.bundle.get("description", "")) if self.strategy else "pre-trained model",
             "trades_learned": len(live),
             "avg_by_action": {k: round(sum(v) / len(v), 4) for k, v in by_action.items()},
             "count_by_action": {k: len(v) for k, v in by_action.items()},
@@ -495,6 +552,7 @@ def run_session(market, agent: Agent, explore: float) -> dict:
     last_entry = min(dt.datetime.combine(today, hm(LAST_ENTRY), NY), close_t - dt.timedelta(minutes=45))
     flatten = min(dt.datetime.combine(today, hm(FLATTEN_AT), NY), close_t - dt.timedelta(minutes=15))
 
+    ex = getattr(agent, "exits", None) or {"sl": STOP_LOSS, "tp": TAKE_PROFIT, "hold": MAX_HOLD_MIN}
     day = {"date": str(today), "trades": 0, "wins": 0, "spent": 0.0, "pl_usd": 0.0,
            "stopped": None, "open": None, "last_decision": None}
     turn = 0
@@ -525,9 +583,9 @@ def run_session(market, agent: Agent, explore: float) -> dict:
             else:
                 held = (now - dt.datetime.fromisoformat(t["opened"])).total_seconds() / 60
                 t.update(plpc=round(pos["plpc"], 4), pl_usd=round(pos["pl"], 2), entry=pos["entry"])
-                reason = ("stop-loss" if pos["plpc"] <= STOP_LOSS else
-                          "take-profit" if pos["plpc"] >= TAKE_PROFIT else
-                          "max hold" if held >= MAX_HOLD_MIN else
+                reason = ("stop-loss" if pos["plpc"] <= ex["sl"] else
+                          "take-profit" if pos["plpc"] >= ex["tp"] else
+                          "max hold" if held >= ex["hold"] else
                           "end of day" if now >= flatten else None)
                 if reason:
                     market.close(t["contract"])

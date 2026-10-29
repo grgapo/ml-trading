@@ -155,6 +155,23 @@ def add_signals(df: pd.DataFrame) -> None:
     df["signal_dir"] = np.sign(total).astype(int)   # conflicting signals cancel out
 
 
+def resample(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Turn 1-minute bars into N-minute bars (within each session, labeled by bar start)."""
+    if minutes <= 1:
+        return bars
+    df = bars.set_index("ts")
+    out = df.groupby(df.index.date).resample(f"{minutes}min", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+    out = out.dropna(subset=["close"]).reset_index(level=0, drop=True).reset_index()
+    return out.rename(columns={"index": "ts"})
+
+
+def direction_from(row_or_df, allowed: list[str]):
+    """Signal direction using only the chosen setups (+1, -1, 0; conflicts cancel)."""
+    total = sum(row_or_df[sg] for sg in allowed)
+    return np.sign(total)
+
+
 def fired_signals(row) -> list[str]:
     return [SIGNAL_NAMES[sg] for sg in SIGNALS if row[sg] != 0]
 

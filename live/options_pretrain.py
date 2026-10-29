@@ -100,7 +100,7 @@ def download_month(symbol: str, y: int, m: int) -> pd.DataFrame:
     path = DATA_DIR / symbol / f"{y}-{m:02d}.csv.gz"
     current = (y, m) == (dt.date.today().year, dt.date.today().month)
     if path.exists() and not current:
-        return pd.read_csv(path, parse_dates=["ts"]).assign(ts=lambda d: d["ts"].dt.tz_convert(NY))
+        return pd.read_csv(path).assign(ts=lambda d: pd.to_datetime(d["ts"], utc=True).dt.tz_convert(NY))
     from alpaca.data.enums import DataFeed
     from alpaca.data.historical.stock import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
@@ -154,7 +154,8 @@ def _bs(S, K, T, sigma, call: bool):
 
 
 def simulate_trade(close: np.ndarray, mins: np.ndarray, i: int, end: int, sigma: float,
-                   action: str) -> tuple[float, int, float] | None:
+                   action: str, sl: float = STOP_LOSS, tp: float = TAKE_PROFIT,
+                   hold: int = MAX_HOLD_MIN) -> tuple[float, int, float] | None:
     """Return (P&L fraction of premium, exit index, entry price) or None if untradeable."""
     kind, dte = action.split("_")
     call = kind == "call"
@@ -172,12 +173,13 @@ def simulate_trade(close: np.ndarray, mins: np.ndarray, i: int, end: int, sigma:
     value = _bs(close[j], K, T, sigma, call) * (1 - SPREAD / 2)
     plpc = value / entry - 1
     held = mins[j] - mins[i]
-    hit = (plpc <= STOP_LOSS) | (plpc >= TAKE_PROFIT) | (held >= MAX_HOLD_MIN) | (mins[j] >= FLATTEN_MIN)
+    hit = (plpc <= sl) | (plpc >= tp) | (held >= hold) | (mins[j] >= FLATTEN_MIN)
     k = int(np.argmax(hit)) if hit.any() else len(j) - 1
     return float(max(-1.0, min(1.5, plpc[k]))), int(j[k]), entry
 
 
-def build_dataset(frames: dict[str, pd.DataFrame]) -> dict:
+def build_dataset(frames: dict[str, pd.DataFrame], sl: float = STOP_LOSS, tp: float = TAKE_PROFIT,
+                  hold: int = MAX_HOLD_MIN, progress: bool = True) -> dict:
     X, R, TS, SYM, EXIT_TS, ENTRY = [], [], [], [], [], []
     days_total = sum(df["date"].nunique() for df in frames.values())
     done, t0 = 0, time.time()
@@ -185,15 +187,18 @@ def build_dataset(frames: dict[str, pd.DataFrame]) -> dict:
         mins = (df["ts"].dt.hour * 60 + df["ts"].dt.minute - 570).to_numpy()
         close = df["close"].to_numpy(float)
         logret = np.diff(np.log(close), prepend=np.log(close[0]))
-        rv = pd.Series(logret).rolling(390, min_periods=120).std().to_numpy() * math.sqrt(252 * 390)
+        step = int(np.median(np.diff(mins)[np.diff(mins) > 0])) if len(mins) > 1 else 1   # bar size in minutes
+        per_day = 390 // max(step, 1)
+        rv = (pd.Series(logret).rolling(per_day, min_periods=max(20, per_day // 3)).std().to_numpy()
+              * math.sqrt(252 * per_day))
         feats = df[FEATURES].to_numpy(float)
         for _, idx in df.groupby("date").indices.items():
             idx = np.sort(idx)
             day_end = idx[-1]
-            sig_dir = df["signal_dir"].to_numpy()
+            any_sig = (df[SIGNALS].to_numpy() != 0).any(axis=1)
             for i in idx:
                 m = mins[i]
-                if m < FIRST_ENTRY_MIN or m > LAST_ENTRY_MIN or sig_dir[i] == 0:
+                if m < FIRST_ENTRY_MIN or m > LAST_ENTRY_MIN or not any_sig[i]:
                     continue
                 f = feats[i].copy()
                 if np.isnan(f[FEATURES.index("day_gap")]):
@@ -201,8 +206,8 @@ def build_dataset(frames: dict[str, pd.DataFrame]) -> dict:
                 if np.isnan(f).any() or np.isnan(rv[i]):
                     continue
                 sigma = float(np.clip(rv[i] * IV_MULT, 0.08, 1.2))
-                end = min(day_end, i + MAX_HOLD_MIN)
-                outs = [simulate_trade(close, mins, i, end, sigma, a) for a in TRADE_ACTIONS]
+                end = min(day_end, i + hold)                     # enough bars for any bar size
+                outs = [simulate_trade(close, mins, i, end, sigma, a, sl, tp, hold) for a in TRADE_ACTIONS]
                 if any(o is None for o in outs):
                     continue
                 X.append(f)
@@ -212,7 +217,7 @@ def build_dataset(frames: dict[str, pd.DataFrame]) -> dict:
                 TS.append(df["ts"].iat[i].value)
                 SYM.append(symbol)
             done += 1
-            if done % 20 == 0 or done == days_total:
+            if progress and (done % 20 == 0 or done == days_total):
                 rate = (time.time() - t0) / done
                 write_status(phase="simulating trades", symbol=symbol, epoch=done, epochs=days_total,
                              seconds_left=round(rate * (days_total - done)))
@@ -237,7 +242,7 @@ def predict(models: list, X: np.ndarray) -> np.ndarray:
     return np.column_stack([m.predict(X) for m in models])
 
 
-def trade_month(data: dict, rows: np.ndarray, choose) -> dict:
+def trade_month(data: dict, rows: np.ndarray, choose, per_trade: float = PER_TRADE) -> dict:
     """Replay one month under the live daily rules. choose(row) -> action index (0..3) or None."""
     days = {}
     for r in rows:
@@ -252,7 +257,7 @@ def trade_month(data: dict, rows: np.ndarray, choose) -> dict:
             if a is None:
                 continue
             entry = data["entry"][r, a]
-            qty = int(min(PER_TRADE, DAILY_BUDGET - spent) // (entry * 100))
+            qty = int(min(per_trade, DAILY_BUDGET - spent) // (entry * 100))
             if qty < 1:
                 continue
             ret = data["R"][r, a]
