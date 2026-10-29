@@ -13,7 +13,14 @@ FEATURES = [
     "ret_5m", "ret_15m", "vwap_gap", "volume_ratio", "ema9_vs_21", "price_vs_ema21",
     "rsi_14", "macd_hist", "macd_slope", "atr_pct", "atr_regime", "fvg_balance",
     "range_pos", "day_gap", "minutes_since_open", "minutes_to_close", "is_qqq",
+    # signal context (meta-labeling): which setup fired, its direction, and its shape
+    "price_vs_ema50", "ema50_slope", "or_size_pct", "or_pos",
+    "sig_vwap", "sig_ema50", "sig_orb", "sig_fvg", "signal_dir",
 ]
+SIGNALS = ["sig_vwap", "sig_ema50", "sig_orb", "sig_fvg"]
+SIGNAL_NAMES = {"sig_vwap": "VWAP cross", "sig_ema50": "50 EMA cross",
+                "sig_orb": "opening-range breakout", "sig_fvg": "FVG retest"}
+OPENING_RANGE_MIN = 15
 
 
 def _ema(s: pd.Series, n: int) -> pd.Series:
@@ -82,11 +89,78 @@ def add_indicators(bars: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df["minutes_since_open"] = mins - (9 * 60 + 30)
     df["minutes_to_close"] = (16 * 60) - mins
     df["is_qqq"] = 1.0 if symbol.upper() == "QQQ" else 0.0
+    add_signals(df)
     return df
 
 
-def feature_row(df: pd.DataFrame, i: int) -> np.ndarray:
-    return df.loc[i, FEATURES].to_numpy(dtype=float)
+def _cross(a: pd.Series, b: pd.Series) -> pd.Series:
+    """+1 when a crosses above b on this bar, -1 when it crosses below, else 0."""
+    above, was_above = a > b, a.shift(1) > b.shift(1)
+    return (above & ~was_above).astype(int) - (~above & was_above).astype(int)
+
+
+def add_signals(df: pd.DataFrame) -> None:
+    """The four setups. Each column is +1 (bullish), -1 (bearish) or 0 on every bar."""
+    c, h, lo = df["close"], df["high"], df["low"]
+    day = df["date"]
+    since_open = df["minutes_since_open"]
+
+    ema50 = _ema(c, 50)
+    df["price_vs_ema50"] = c / ema50 - 1
+    df["ema50_slope"] = (ema50 / ema50.shift(10) - 1) * 1e4        # bp per 10 minutes
+
+    # 1. VWAP cross and 2. price crossing the 50 EMA.
+    df["sig_vwap"] = _cross(c, df["vwap"]).where(since_open >= 1, 0)
+    df["sig_ema50"] = _cross(c, ema50)
+
+    # 3. Opening-range breakout: range = first 15 minutes; first close beyond it, once per side per day.
+    in_or = since_open < OPENING_RANGE_MIN
+    or_hi = h.where(in_or).groupby(day).transform("max")
+    or_lo = lo.where(in_or).groupby(day).transform("min")
+    df["or_size_pct"] = (or_hi - or_lo) / c
+    df["or_pos"] = (c - or_lo) / (or_hi - or_lo).replace(0, np.nan)
+    after = since_open >= OPENING_RANGE_MIN
+    up = (after & (c > or_hi)).astype(int)
+    dn = (after & (c < or_lo)).astype(int)
+    first_up = (up == 1) & (up.groupby(day).cumsum() == 1)
+    first_dn = (dn == 1) & (dn.groupby(day).cumsum() == 1)
+    df["sig_orb"] = first_up.astype(int) - first_dn.astype(int)
+
+    # 4. FVG retest: a fair value gap forms, then price comes back into it and holds.
+    #    Bullish gap = this bar's low above the high 2 bars back; signal when a later bar
+    #    dips into the gap but closes above its bottom (within 30 minutes). Mirror for bearish.
+    sig = np.zeros(len(df), dtype=int)
+    hv, lv, cv = h.to_numpy(), lo.to_numpy(), c.to_numpy()
+    min_gap = cv * 0.0002
+    for _, idx in df.groupby(day).indices.items():
+        idx = np.sort(idx)
+        bull = bear = None                        # (gap_bottom, gap_top, formed_at)
+        for k in range(2, len(idx)):
+            i, i2 = idx[k], idx[k - 2]
+            if bull and k - bull[2] > 30:
+                bull = None
+            if bear and k - bear[2] > 30:
+                bear = None
+            if bull and k > bull[2] and lv[i] <= bull[1] and cv[i] > bull[0]:
+                sig[i], bull = 1, None
+            elif bear and k > bear[2] and hv[i] >= bear[0] and cv[i] < bear[1]:
+                sig[i], bear = -1, None
+            if lv[i] - hv[i2] > min_gap[i]:
+                bull = (hv[i2], lv[i], k)
+            if lv[i2] - hv[i] > min_gap[i]:
+                bear = (hv[i], lv[i2], k)
+    df["sig_fvg"] = sig
+
+    total = df[SIGNALS].sum(axis=1)
+    df["signal_dir"] = np.sign(total).astype(int)   # conflicting signals cancel out
+
+
+def fired_signals(row) -> list[str]:
+    return [SIGNAL_NAMES[sg] for sg in SIGNALS if row[sg] != 0]
+
+
+def feature_row(df: pd.DataFrame, i: int, names=None) -> np.ndarray:
+    return df.loc[i, names or FEATURES].to_numpy(dtype=float)
 
 
 def describe(row: dict | pd.Series) -> str:

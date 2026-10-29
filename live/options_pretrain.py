@@ -1,8 +1,9 @@
-"""Pre-train the options bot on years of real SPY/QQQ 1-minute history.
+"""Pre-train the options bot on years of real SPY/QQQ 1-minute history (meta-labeling).
 
   1. Download 1-minute bars (Alpaca, free IEX feed) and cache them by month.
-  2. Add indicators (live/features.py: VWAP, volume, FVGs, EMAs, RSI, MACD, ATR...).
-  3. Every DECISION_EVERY minutes of each day, simulate ALL four trades
+  2. Add indicators and the four setups (live/features.py): VWAP cross, 50 EMA cross,
+     opening-range breakout, FVG retest.
+  3. At every bar where a setup fires, simulate ALL four trades
      (1DTE/0DTE call/put) with the bot's real rules: entry/exit spread,
      -35% stop, +50% target, 60-minute max hold, flat by 15:45. Options are
      priced with Black-Scholes using recent realized volatility.
@@ -35,7 +36,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from features import FEATURES, add_indicators  # noqa: E402
+from features import FEATURES, SIGNAL_NAMES, SIGNALS, add_indicators  # noqa: E402
 
 NY = ZoneInfo("America/New_York")
 ACTIONS = ["skip", "call_1dte", "put_1dte", "call_0dte", "put_0dte"]
@@ -60,6 +61,8 @@ DECISION_EVERY = int(os.environ.get("OPT_DECISION_EVERY", "10"))
 FIRST_ENTRY_MIN, LAST_ENTRY_MIN, FLATTEN_MIN = 15, 330, 375  # minutes after 9:30
 RATE = 0.04
 MIN_TRAIN_MONTHS = 6
+EMBARGO_DAYS = int(os.environ.get("OPT_EMBARGO_DAYS", "5"))   # gap between training data and each test month
+DIRECTIONAL = {1: [0, 2], -1: [1, 3]}   # bullish -> calls (1DTE, 0DTE), bearish -> puts
 
 STATUS = {"name": "Options pre-training", "phase": "starting", "started": None, "symbol": None,
           "index": 0, "total": None, "epoch": None, "epochs": None, "seconds_left": None,
@@ -187,9 +190,10 @@ def build_dataset(frames: dict[str, pd.DataFrame]) -> dict:
         for _, idx in df.groupby("date").indices.items():
             idx = np.sort(idx)
             day_end = idx[-1]
+            sig_dir = df["signal_dir"].to_numpy()
             for i in idx:
                 m = mins[i]
-                if m < FIRST_ENTRY_MIN or m > LAST_ENTRY_MIN or m % DECISION_EVERY:
+                if m < FIRST_ENTRY_MIN or m > LAST_ENTRY_MIN or sig_dir[i] == 0:
                     continue
                 f = feats[i].copy()
                 if np.isnan(f[FEATURES.index("day_gap")]):
@@ -238,7 +242,7 @@ def trade_month(data: dict, rows: np.ndarray, choose) -> dict:
     days = {}
     for r in rows:
         days.setdefault(pd.Timestamp(data["ts"][r], tz="UTC").tz_convert(NY).date(), []).append(r)
-    pnl_days, n_trades, n_wins = [], 0, 0
+    pnl_days, taken = [], []
     for _, rs in sorted(days.items()):
         busy_until, trades, wins, spent, pnl = 0, 0, 0, 0.0, 0.0
         for r in rs:
@@ -252,52 +256,81 @@ def trade_month(data: dict, rows: np.ndarray, choose) -> dict:
             if qty < 1:
                 continue
             ret = data["R"][r, a]
+            dollars = qty * entry * 100 * ret
             spent += qty * entry * 100
-            pnl += qty * entry * 100 * ret
+            pnl += dollars
             trades += 1
             wins += ret > 0
             busy_until = data["exit_ts"][r, a]
+            taken.append((r, a, dollars, ret))
         pnl_days.append(pnl)
-        n_trades += trades
-        n_wins += wins
     return {"pnl": float(sum(pnl_days)), "days": len(pnl_days), "green_days": int(sum(p > 0 for p in pnl_days)),
-            "trades": n_trades, "wins": n_wins}
+            "trades": len(taken), "wins": int(sum(t[3] > 0 for t in taken)), "taken": taken}
+
+
+def _scorecard(data: dict, taken: list, card: dict, key: str) -> None:
+    for r, a, dollars, ret in taken:
+        for sg in SIGNALS:
+            if data["X"][r, FEATURES.index(sg)] != 0:
+                c = card.setdefault(sg, {"signal": SIGNAL_NAMES[sg]})
+                c[f"{key}_trades"] = c.get(f"{key}_trades", 0) + 1
+                c[f"{key}_wins"] = c.get(f"{key}_wins", 0) + int(ret > 0)
+                c[f"{key}_pnl"] = round(c.get(f"{key}_pnl", 0.0) + dollars, 2)
 
 
 def walk_forward(data: dict) -> dict:
-    month = np.array([pd.Timestamp(t, tz="UTC").tz_convert(NY).strftime("%Y-%m") for t in data["ts"]])
+    ts = pd.to_datetime(data["ts"], utc=True).tz_convert(NY)
+    month = np.array(ts.strftime("%Y-%m"))
     months = sorted(set(month))
     folds = months[MIN_TRAIN_MONTHS:]
     write_status(phase="walk-forward test", total=len(folds), index=0, results=[], epoch=None, seconds_left=None)
     rng = random.Random(0)
-    model_tot = {"pnl": 0.0, "days": 0, "green_days": 0, "trades": 0, "wins": 0}
-    rand_tot = dict(model_tot)
+    dir_col = FEATURES.index("signal_dir")
+    totals = {k: {"pnl": 0.0, "days": 0, "green_days": 0, "trades": 0, "wins": 0} for k in ("model", "rule", "random")}
+    cards: dict = {}
     t0 = time.time()
     for k, test_m in enumerate(folds, 1):
-        train = month < test_m
+        test_start = pd.Timestamp(test_m + "-01", tz=NY)
+        train = np.asarray(ts < test_start - pd.Timedelta(days=EMBARGO_DAYS))
         test_rows = np.flatnonzero(month == test_m)
         models = fit_models(data["X"][train], data["R"][train])
         preds = predict(models, data["X"][test_rows])
         pred_of = dict(zip(test_rows, preds))
 
+        def allowed(r):
+            return DIRECTIONAL.get(int(data["X"][r, dir_col]), [])
+
         def model_choice(r):
-            p = pred_of[r]
-            a = int(np.argmax(p))
-            return a if p[a] >= MIN_EDGE else None
+            options = allowed(r)
+            if not options:
+                return None
+            a = max(options, key=lambda x: pred_of[r][x])
+            return a if pred_of[r][a] >= MIN_EDGE else None
+
+        def rule_choice(r):                       # take every signal, 1DTE in its direction
+            options = allowed(r)
+            return options[0] if options else None
 
         def random_choice(r):
             return rng.randrange(4) if rng.random() < 0.3 else None
 
-        mres, rres = trade_month(data, test_rows, model_choice), trade_month(data, test_rows, random_choice)
-        for tot, res in ((model_tot, mres), (rand_tot, rres)):
-            for key in tot:
-                tot[key] += res[key]
+        results = {"model": trade_month(data, test_rows, model_choice),
+                   "rule": trade_month(data, test_rows, rule_choice),
+                   "random": trade_month(data, test_rows, random_choice)}
+        for name, res in results.items():
+            for key in totals[name]:
+                totals[name][key] += res[key]
+        _scorecard(data, results["model"]["taken"], cards, "model")
+        _scorecard(data, results["rule"]["taken"], cards, "rule")
+        mres = results["model"]
         STATUS["results"].append({"symbol": test_m, "test_excess": round(mres["pnl"] / DAILY_BUDGET, 4),
                                   "display": f"{'+' if mres['pnl'] >= 0 else '-'}${abs(mres['pnl']):,.0f}",
-                                  "trades": mres["trades"], "random_pnl": round(rres["pnl"], 2)})
+                                  "trades": mres["trades"], "rule_pnl": round(results["rule"]["pnl"], 2)})
         rate = (time.time() - t0) / k
-        write_status(index=k, symbol=test_m, seconds_left=round(rate * (len(folds) - k)))
-    return {"model": model_tot, "random": rand_tot, "months_tested": len(folds),
+        write_status(index=k, symbol=test_m, scorecards=list(cards.values()),
+                     seconds_left=round(rate * (len(folds) - k)))
+    return {**totals, "scorecards": list(cards.values()), "months_tested": len(folds),
+            "embargo_days": EMBARGO_DAYS,
             "first_test_month": folds[0] if folds else None, "last_test_month": folds[-1] if folds else None}
 
 
@@ -337,18 +370,21 @@ def main() -> int:
         first = pd.Timestamp(data["ts"][0], tz="UTC").tz_convert(NY).date()
         last = pd.Timestamp(data["ts"][-1], tz="UTC").tz_convert(NY).date()
         bundle = {"models": models, "features": FEATURES, "actions": ACTIONS, "min_edge": MIN_EDGE,
+                  "signal_mode": True, "version": 2,
                   "trained_from": str(first), "trained_to": str(last), "decisions": int(len(data["X"])),
                   "walk_forward": wf, "synthetic": args.synthetic,
                   "created": dt.datetime.now(NY).isoformat(timespec="seconds")}
         joblib.dump(bundle, MODEL_PATH)
 
-        m, r = wf["model"], wf["random"]
+        m, rl, r = wf["model"], wf["rule"], wf["random"]
         usd = lambda v: f"{'-' if v < 0 else '+'}${abs(v):,.0f}"
         summary = {"beat_buy_and_hold": m["green_days"], "stocks": m["days"], "avg_test_excess": None,
                    "text": (f"walk-forward {wf['first_test_month']}→{wf['last_test_month']}: "
                             f"model {usd(m['pnl'])} over {m['trades']} trades ({m['wins']} winners, "
-                            f"{m['green_days']}/{m['days']} green days) vs random {usd(r['pnl'])}")}
-        write_status(phase="done", summary=summary, symbol=None, seconds_left=None, epoch=None)
+                            f"{m['green_days']}/{m['days']} green days) · take-every-signal {usd(rl['pnl'])} "
+                            f"over {rl['trades']} · random {usd(r['pnl'])}")}
+        write_status(phase="done", summary=summary, symbol=None, seconds_left=None, epoch=None,
+                     scorecards=wf["scorecards"])
         print(summary["text"])
         print(f"model saved: {MODEL_PATH} ({len(data['X'])} simulated decisions, {first} to {last})")
         return 0

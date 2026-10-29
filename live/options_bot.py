@@ -164,30 +164,43 @@ class ModelAgent:
         self.model_path, self.live_path = model_path, live_path
         self.bundle = joblib.load(model_path)
         self.models = self.bundle["models"]
+        self.names = self.bundle["features"]
+        self.signal_mode = bool(self.bundle.get("signal_mode"))
         self.min_edge = float(os.environ.get("OPT_MIN_EDGE", self.bundle.get("min_edge", 0.03)))
+        self.seen: set = set()        # signal bars already decided on
 
     def decide(self, symbol, bars, now, explore):
         import numpy as np
-        from features import FEATURES, add_indicators, describe
+        from features import add_indicators, describe, fired_signals
         df = add_indicators(bars, symbol)
         if len(df) < 60:
             return None
         row = df.iloc[-1].copy()
         if pd_isna(row["day_gap"]):
             row["day_gap"] = 0.0
-        f = row[FEATURES].to_numpy(dtype=float)
+        allowed = [1, 2, 3, 4]                 # ACTIONS index: call_1dte, put_1dte, call_0dte, put_0dte
+        label = ""
+        if self.signal_mode:                   # meta-labeling: only act when a setup fires
+            key = (symbol, str(row["ts"]))
+            direction = int(row["signal_dir"])
+            if direction == 0 or key in self.seen:
+                return None
+            self.seen.add(key)
+            allowed = [1, 3] if direction > 0 else [2, 4]
+            label = f"{', '.join(fired_signals(row))} {'▲' if direction > 0 else '▼'} · "
+        f = row[self.names].to_numpy(dtype=float)
         if np.isnan(f).any():
             return None
         preds = [float(m.predict(f.reshape(1, -1))[0]) for m in self.models]
-        best = int(np.argmax(preds))
         explored = random.random() < explore
         if explored:
-            a = random.randrange(4) + 1
+            a = random.choice(allowed)
         else:
-            a = best + 1 if preds[best] >= self.min_edge else 0
-        return {"action": a, "explored": explored, "situation": f"{symbol} · " + describe(row),
+            best = max(allowed, key=lambda x: preds[x - 1])
+            a = best if preds[best - 1] >= self.min_edge else 0
+        return {"action": a, "explored": explored, "situation": f"{symbol} · {label}" + describe(row),
                 "features": [round(x, 8) for x in f.tolist()],
-                "preds": {ACTIONS[i + 1]: round(p, 4) for i, p in enumerate(preds)}}
+                "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in allowed}}
 
     def learn_trade(self, trade: dict, reward: float, date: str) -> None:
         new = not self.live_path.exists()
@@ -549,10 +562,18 @@ def run_session(market, agent: Agent, explore: float) -> dict:
             elif room < 50:
                 day["stopped"] = "daily budget used"
             else:
-                symbol = SYMBOLS[turn % len(SYMBOLS)]
-                turn += 1
-                bars = market.bars(symbol)
-                d = agent.decide(symbol, bars, now, explore) if len(bars) else None
+                # Model with signals: check every symbol each minute. Table agent: alternate.
+                if getattr(agent, "signal_mode", False):
+                    candidates = SYMBOLS
+                else:
+                    candidates = [SYMBOLS[turn % len(SYMBOLS)]]
+                    turn += 1
+                d = None
+                for symbol in candidates:
+                    bars = market.bars(symbol)
+                    d = agent.decide(symbol, bars, now, explore) if len(bars) else None
+                    if d:
+                        break
                 if d:
                     closes = bars["close"].tolist()
                     sit, explored = d["situation"], d["explored"]
@@ -573,7 +594,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                                            "plpc": 0.0, "pl_usd": 0.0}
                         else:
                             day["last_decision"]["note"] = "too expensive or no contract"
-                status("in a trade" if day["open"] else "watching")
+                status("in a trade" if day["open"] else
+                       "watching for setups" if getattr(agent, "signal_mode", False) else "watching")
         else:
             if now >= flatten:
                 break
