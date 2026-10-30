@@ -231,6 +231,79 @@ def write_status(**info) -> None:
     save_json(STATUS_PATH, info)
 
 
+# ---- champion monitoring: demote a live champion that stops working ------------------------
+MIN_LIVE_TRADES = int(os.environ.get("OPT_MIN_LIVE_TRADES", "30"))
+MAX_LIVE_LOSS = float(os.environ.get("OPT_MAX_LIVE_LOSS", str(3 * DAILY_BUDGET)))
+
+
+def live_record(champion: dict) -> dict | None:
+    """Real paper trades taken since this champion was promoted."""
+    import csv
+    path = STATE_DIR / "options_trades.csv"
+    since = champion.get("promoted")
+    if not champion.get("params") or not since or not path.exists():
+        return None
+    rows = [r for r in csv.DictReader(path.open()) if r.get("opened", "") >= since]
+    pnl = [float(r["pl_usd"]) for r in rows if r.get("pl_usd")]
+    n = len(pnl)
+    mean = sum(pnl) / n if n else 0.0
+    sd = (sum((x - mean) ** 2 for x in pnl) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    expected = (champion.get("holdout_pnl") or 0.0) / max(1, champion.get("holdout_trades") or 1)
+    return {"trades": n, "pnl": round(sum(pnl), 2), "mean": round(mean, 2), "sd": round(sd, 2),
+            "expected_mean": round(expected, 2), "wins": sum(x > 0 for x in pnl),
+            "checked": dt.datetime.now(NY).isoformat(timespec="seconds")}
+
+
+def demote(champion: dict, reason: str) -> None:
+    prev = MODEL_PATH.with_name("options_model.prev.joblib")
+    if prev.exists():
+        prev.replace(MODEL_PATH)
+        fallback = "previous model restored"
+    elif MODEL_PATH.exists():
+        MODEL_PATH.unlink()
+        fallback = "no model: bot back to its learning table"
+    else:
+        fallback = "no model installed"
+    history = champion.setdefault("history", [])
+    history.append({"desc": champion.get("desc"), "promoted": champion.get("promoted"),
+                    "demoted": dt.datetime.now(NY).isoformat(timespec="seconds"), "reason": reason,
+                    "live": champion.get("live")})
+    champion.update(params=None, desc="none (last champion demoted: " + reason + ")",
+                    search_pnl=0.0, holdout_pnl=0.0, holdout_trades=0, promoted=None, live=None, regrade=[])
+    save_json(CHAMPION, champion)
+    notify(f"Options champion demoted: {reason}. {fallback}.")
+
+
+def monitor_champion(champion: dict, raw: dict, memo: dict) -> None:
+    """Nightly: live record vs expectation, plus a re-grade on the current (rolled) holdout."""
+    if not champion.get("params"):
+        return
+    rec = live_record(champion)
+    if rec:
+        champion["live"] = rec
+        n, mean, sd, exp = rec["trades"], rec["mean"], rec["sd"], rec["expected_mean"]
+        if rec["pnl"] <= -MAX_LIVE_LOSS:
+            return demote(champion, f"lost ${-rec['pnl']:,.0f} live over {n} trades")
+        clearly_worse = sd == 0 or (exp - mean) > 2 * sd / (n ** 0.5)
+        if n >= MIN_LIVE_TRADES and mean < 0 and clearly_worse:
+            return demote(champion, f"live avg ${mean:,.0f}/trade over {n} trades, expected ${exp:,.0f}")
+        rec["status"] = "under review" if (n >= MIN_LIVE_TRADES and mean < exp) else "ok" if n >= 10 else "too early to judge"
+    try:
+        data = dataset_for(champion["params"], raw, memo)
+        folds, (h0, h1) = holdout_fold(data)
+        res = run_folds(data, champion["params"], folds)
+        regrade = champion.setdefault("regrade", [])
+        if not regrade or regrade[-1]["to"] != h1:
+            regrade.append({"from": h0, "to": h1, "pnl": round(res["pnl"], 2), "trades": res["trades"],
+                            "at": dt.datetime.now(NY).isoformat(timespec="seconds")})
+            del regrade[:-6]
+        if len(regrade) >= 2 and regrade[-1]["pnl"] < 0 and regrade[-2]["pnl"] < 0:
+            return demote(champion, f"negative on the rolled holdout twice in a row ({h0} to {h1})")
+    except Exception as exc:
+        champion["regrade_error"] = f"{type(exc).__name__}: {exc}"
+    save_json(CHAMPION, champion)
+
+
 def promote(entry: dict, raw: dict, memo: dict, champion: dict) -> None:
     import joblib
     p = entry["params"]
@@ -251,7 +324,8 @@ def promote(entry: dict, raw: dict, memo: dict, champion: dict) -> None:
         MODEL_PATH.replace(MODEL_PATH.with_name("options_model.prev.joblib"))
     joblib.dump(bundle, MODEL_PATH)
     champion.update(params=p, desc=entry["desc"], search_pnl=entry["search"]["pnl"],
-                    holdout_pnl=entry["holdout"]["pnl"], promoted=bundle["created"])
+                    holdout_pnl=entry["holdout"]["pnl"], holdout_trades=entry["holdout"]["trades"],
+                    promoted=bundle["created"], live=None, regrade=[])
     save_json(CHAMPION, champion)
     notify(f"New champion promoted to the options bot: {entry['desc']} "
            f"(holdout {entry['holdout']['pnl']:+,.0f} over {entry['holdout']['trades']} trades)")
@@ -298,6 +372,8 @@ def main() -> int:
     raw = load_raw(args.months, args.symbols.replace(" ", "").split(","), args.synthetic)
     memo: dict = {}
     try:
+        status("checking the live champion")
+        monitor_champion(champion, raw, memo)
         while tonight < args.trials and (deadline is None or dt.datetime.now(NY) < deadline - dt.timedelta(minutes=20)):
             p = sample(rng)
             k = key_of(p)
