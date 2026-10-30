@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pandas>=2.0",
+    "numpy",
+    "matplotlib",
+    "yfinance",
+    "scipy",  # yfinance needs it for repair=True
 ]
 
 [project.optional-dependencies]
