@@ -124,9 +124,15 @@ def fit_with_confidence(X: np.ndarray, R: np.ndarray, confidence) -> tuple[list,
 
 
 # ---- grading ---------------------------------------------------------------------------
+RECENT_TRADES: list = []        # sample of simulated trades for the app's live stream
+
+
 def run_folds(data: dict, p: dict, folds: list[tuple[np.ndarray, np.ndarray]]) -> dict:
     ok, direction = qualify(data, p)
     tot = {"pnl": 0.0, "days": 0, "green_days": 0, "trades": 0, "wins": 0}
+    by_month: dict = {}
+    names = ["call 1DTE", "put 1DTE", "call 0DTE", "put 0DTE"]
+    simulated = 0
     for train_mask, test_rows in folds:
         test_rows = test_rows[ok[test_rows]]
         if len(test_rows) == 0:
@@ -153,8 +159,17 @@ def run_folds(data: dict, p: dict, folds: list[tuple[np.ndarray, np.ndarray]]) -
             return a
 
         res = trade_month(data, test_rows, choose)
+        simulated += int(len(test_rows)) * 4               # every qualifying moment, all 4 trades simulated
         for k in tot:
             tot[k] += res[k]
+        for r, a, dollars, ret in res["taken"]:
+            t = pd.Timestamp(data["ts"][r], tz="UTC").tz_convert(NY)
+            by_month[t.strftime("%Y-%m")] = by_month.get(t.strftime("%Y-%m"), 0.0) + dollars
+            RECENT_TRADES.append({"t": t.isoformat(timespec="minutes"), "sym": str(data["sym"][r]),
+                                  "trade": names[a], "pnl": round(float(dollars), 2)})
+    del RECENT_TRADES[:-400]
+    tot["months"] = [[m, round(v, 2)] for m, v in sorted(by_month.items())]
+    tot["simulated"] = simulated
     return tot
 
 
@@ -267,6 +282,10 @@ def main() -> int:
         ranked = sorted((e for e in board if e["search"]["trades"] >= MIN_TRADES),
                         key=lambda e: e["search"]["pnl"], reverse=True)
         write_status(phase=phase, started=started, trials_tonight=tonight, trials_total=len(board),
+                     simulated_total=sum(e["search"].get("simulated", 0) for e in board),
+                     sim_trades_taken=sum(e["search"]["trades"] for e in board),
+                     sim_wins=sum(e["search"]["wins"] for e in board),
+                     profitable=sum(e["search"]["pnl"] > 0 and e["search"]["trades"] >= MIN_TRADES for e in board),
                      deadline=deadline.isoformat(timespec="minutes") if deadline else None,
                      current=current, best=[summarize(e) for e in ranked[:5]],
                      champion=champion, holdout_months=HOLDOUT_MONTHS)
@@ -288,6 +307,8 @@ def main() -> int:
             board.append({"params": p, "desc": describe(p), "search": res, "search_period": [f0, f1],
                           "tested": dt.datetime.now(NY).isoformat(timespec="seconds")})
             save_json(LEADERBOARD, board)
+            save_json(SEARCH_DIR / "recent_trades.json",
+                      {"variation": describe(p), "trades": RECENT_TRADES[-300:]})
             tonight += 1
 
         # One holdout look per night: best untested candidate that clears the bar.
