@@ -103,6 +103,10 @@ def qualify(data: dict, p: dict) -> tuple[np.ndarray, np.ndarray]:
     lo, hi = WINDOWS[p["window"]]
     m = X[:, COL["minutes_since_open"]]
     ok = (direction != 0) & (m >= lo) & (m <= hi)
+    need = p.get("confluence") or 1
+    if need > 1:
+        agree = np.where(direction > 0, X[:, COL["conf_bull"]], X[:, COL["conf_bear"]])
+        ok &= agree >= need
     vf = p.get("vol_filter", "off")
     if vf not in (None, "off"):
         vr = X[:, COL["vol_ratio"]]

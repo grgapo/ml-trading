@@ -16,10 +16,13 @@ FEATURES = [
     # signal context (meta-labeling): which setup fired, its direction, and its shape
     "price_vs_ema50", "ema50_slope", "or_size_pct", "or_pos",
     "sig_vwap", "sig_ema50", "sig_orb", "sig_fvg", "signal_dir",
+    # confluence: how many DIFFERENT setups agree (bullish / bearish) within the last 15 bars
+    "conf_bull", "conf_bear",
     # daily volatility regime (GARCH forecast for today vs recent realized volatility)
     "garch_vol", "vol_ratio",
 ]
-FEATURE_VERSION = 2   # bump when inputs change, so cached practice data is rebuilt
+FEATURE_VERSION = 3   # bump when inputs change, so cached practice data is rebuilt
+CONFLUENCE_BARS = 15
 SIGNALS = ["sig_vwap", "sig_ema50", "sig_orb", "sig_fvg"]
 SIGNAL_NAMES = {"sig_vwap": "VWAP cross", "sig_ema50": "50 EMA cross",
                 "sig_orb": "opening-range breakout", "sig_fvg": "FVG retest"}
@@ -156,6 +159,14 @@ def add_signals(df: pd.DataFrame) -> None:
 
     total = df[SIGNALS].sum(axis=1)
     df["signal_dir"] = np.sign(total).astype(int)   # conflicting signals cancel out
+
+    # Confluence: count the distinct setups that fired bullish (bearish) in the last
+    # CONFLUENCE_BARS bars of the same day, so setups can confirm each other.
+    bull = sum((df[sg] > 0).astype(int).groupby(day).transform(
+        lambda x: x.rolling(CONFLUENCE_BARS, min_periods=1).max()) for sg in SIGNALS)
+    bear = sum((df[sg] < 0).astype(int).groupby(day).transform(
+        lambda x: x.rolling(CONFLUENCE_BARS, min_periods=1).max()) for sg in SIGNALS)
+    df["conf_bull"], df["conf_bear"] = bull.astype(float), bear.astype(float)
 
 
 def resample(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:

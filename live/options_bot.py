@@ -256,7 +256,11 @@ class ModelAgent:
             return None
         self.seen.add(key)
         row["garch_vol"], row["vol_ratio"] = self._vol_today(symbol, now, float(row["close"]))
-        from strategy import vol_ok
+        from strategy import confluence_ok, vol_ok
+        if not confluence_ok(direction, row.get("conf_bull", 1), row.get("conf_bear", 1), st.get("confluence")):
+            return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: only "
+                    f"{int(row['conf_bull'] if direction > 0 else row['conf_bear'])} setup(s) agree, needs {st['confluence']}",
+                    "features": None, "preds": None}
         if not vol_ok(row["vol_ratio"], st.get("vol_filter", "off")):
             return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: "
                     f"{st.get('vol_filter')} days only (vol ratio {row['vol_ratio']:.2f})",

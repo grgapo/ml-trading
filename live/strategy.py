@@ -21,6 +21,8 @@ SPACE = {
     "vol_filter": ["off", "calm", "volatile"],
     # split-conformal check: only trade if the model is this sure the trade won't lose
     "confidence": ["off", 0.7, 0.8],
+    # how many different setups must agree (within ~15 bars) before a trade is allowed
+    "confluence": [1, 2, 3],
 }
 VOL_SPLIT = 1.0   # vol_ratio above this = volatility expected to rise ("volatile")
 SIGNAL_SETS = [list(c) for n in range(1, len(SIGNALS) + 1) for c in itertools.combinations(SIGNALS, n)]
@@ -43,6 +45,8 @@ def describe(p: dict) -> str:
     if p["use_model"] and conf not in (None, "off"):
         pick += f" · {conf:.0%} sure"
     vol = p.get("vol_filter", "off")
+    if (p.get("confluence") or 1) > 1:
+        pick += f" · {p['confluence']}+ agree"
     return (f"{p['bar_minutes']}m · {sigs} · SL{p['stop_loss']:.0%} TP+{p['take_profit']:.0%} · "
             f"{p['max_hold']}min · {p['dte'].upper()} · {p['window']} · {pick}"
             + (f" · {vol} days" if vol not in (None, "off") else ""))
@@ -50,6 +54,11 @@ def describe(p: dict) -> str:
 
 def dataset_key(p: dict) -> str:
     return f"v{FEATURE_VERSION}_b{p['bar_minutes']}_sl{p['stop_loss']}_tp{p['take_profit']}_h{p['max_hold']}"
+
+
+def confluence_ok(direction: int, conf_bull: float, conf_bear: float, need) -> bool:
+    need = need or 1
+    return (conf_bull if direction > 0 else conf_bear) >= need
 
 
 def vol_ok(vol_ratio: float, setting: str | None) -> bool:
