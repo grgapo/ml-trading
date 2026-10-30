@@ -17,3 +17,14 @@ Living record of learning algorithms tried in this repo: current status, latest 
 One row per method, always the **current** version. Full history and vs-previous notes live on the method page.
 
 Add or update rows only from a documented training run.
+
+## Todo
+
+Not logged runs. Same rules as the board: `data/clean-yfinance`, cutoff `2024-09-01`, chronological split, no shuffled rows. Features are the stationary columns in `src/ml/regression/ai_scripts/parametric_experiment_common.py` (`Ret_1`, `Overnight`, `Intraday`, `Range`, `Close_Location`, `Relative_Volume`, `Vol_20`, `5_Day_Return`, `20_Day_Return`, `Dist_From_SMA`). No raw price levels.
+
+| Experiment | Target | Model | Score against |
+|------------|--------|-------|----------------|
+| Single-name direction | sign of the next-day `Adj Close` return. Start with SPY | `LogisticRegression` (scaled) and a shallow `RandomForestClassifier` (`max_depth` about 3 to 5, large `min_samples_leaf`) | always-up accuracy, and long/flat growth of $1 vs holding the stock |
+| Cross-sectional median | 1 when that name's next-day return beats the same day's median across `STARTING_STOCKS` | same two classifiers, one row per symbol-day | equal-weight basket of those names. Long only the names predicted to beat the median |
+
+`src/ml/reinforcement-learning/dyna-q-cross-section.py` is a different experiment. It fits a separate long/flat policy per name. It does not rank names against each other on the same day.
