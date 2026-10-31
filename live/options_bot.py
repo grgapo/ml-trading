@@ -615,7 +615,7 @@ def run_session(market, agent: Agent, explore: float) -> dict:
     flatten = min(dt.datetime.combine(today, hm(FLATTEN_AT), NY), close_t - dt.timedelta(minutes=15))
 
     ex = getattr(agent, "exits", None) or {"sl": STOP_LOSS, "tp": TAKE_PROFIT, "hold": MAX_HOLD_MIN}
-    day = {"date": str(today), "trades": 0, "wins": 0, "spent": 0.0, "pl_usd": 0.0,
+    day = {"date": str(today), "trades": 0, "wins": 0, "spent": 0.0, "pl_usd": 0.0, "last_closed": None,
            "stopped": None, "open": None, "last_decision": None}
     turn = 0
 
@@ -648,6 +648,14 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                 t.update(plpc=round(pos["plpc"], 4), pl_usd=round(pos["pl"], 2), entry=pos["entry"])
                 t.setdefault("path", []).append([now.strftime("%H:%M"), round(pos["plpc"], 4)])   # for the app's mini-chart
                 del t["path"][:-240]
+                try:                                     # underlying's 1-min candles since entry, for the app's monitor
+                    b = market.bars(t["symbol"])
+                    since = dt.datetime.fromisoformat(t["opened"]) - dt.timedelta(minutes=3)
+                    b = b[b["ts"] >= since]
+                    t["candles"] = [[r.ts.strftime("%H:%M"), round(float(r.open), 2), round(float(r.high), 2),
+                                     round(float(r.low), 2), round(float(r.close), 2)] for r in b.itertuples()][-90:]
+                except Exception:
+                    pass
                 reason = ("stop-loss" if pos["plpc"] <= ex["sl"] else
                           "take-profit" if pos["plpc"] >= ex["tp"] else
                           "max hold" if held >= ex["hold"] else
@@ -665,6 +673,9 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                                "qty": t["qty"], "entry": round(pos["entry"], 2), "pl_pct": round(pos["plpc"], 4),
                                "pl_usd": round(pos["pl"], 2), "exit_reason": reason,
                                "situation": t["situation"], "explored": t["explored"]})
+                    day["last_closed"] = {"closed": now.isoformat(timespec="seconds"), "symbol": t["symbol"],
+                                          "action": t["action"], "pl_usd": round(pos["pl"], 2),
+                                          "plpc": round(pos["plpc"], 4), "reason": reason}
                     day["open"] = None
                     if day["wins"] >= WIN_TARGET:
                         day["stopped"] = f"hit {WIN_TARGET} winners"
@@ -714,7 +725,7 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                             day["open"] = {"symbol": symbol, "contract": contract, "action": action, "qty": qty,
                                            "opened": now.isoformat(timespec="seconds"), "situation": sit,
                                            "features": d["features"], "explored": explored,
-                                           "plpc": 0.0, "pl_usd": 0.0}
+                                           "plpc": 0.0, "pl_usd": 0.0, "u_entry": round(float(closes[-1]), 2)}
                         else:
                             day["last_decision"]["note"] = "too expensive or no contract"
                 status("in a trade" if day["open"] else
