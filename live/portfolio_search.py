@@ -95,6 +95,9 @@ def main() -> int:
             "top": [{"desc": x["desc"], "search": x["search"], "holdout": x["holdout"]} for x in top],
             "ranking": [{"desc": x["desc"], "cagr": x["search"]["cagr"], "max_dd": x["search"]["max_dd"], "sharpe": x["search"]["sharpe"]}
                         for x in sorted(ok, key=lambda x: -x["search"]["cagr"])[:20]],
+            # every variation's growth curve over the search period, for the app's shared walk-forward graph
+            "all": [{"desc": x["desc"], "cagr": x["search"]["cagr"], "max_dd": x["search"]["max_dd"],
+                     "curve": x["search"].get("curve", [])} for x in rows if x["search"].get("cagr") is not None],
             "champion": {"desc": champ["desc"], "params": champ["params"], "search": champ["search"], "holdout": champ["holdout"],
                          "weights_now": weights} if champ else None,
         }
