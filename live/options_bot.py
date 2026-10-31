@@ -625,7 +625,7 @@ def run_session(market, agent: Agent, explore: float) -> dict:
     def status(phase):
         open_t = {k: v for k, v in (day["open"] or {}).items() if k != "features"} or None
         write_status(phase=phase, session=str(today), max_trades=MAX_TRADES, win_target=WIN_TARGET,
-                     budget=DAILY_BUDGET, **{k: v for k, v in day.items() if k not in ("date", "open")},
+                     budget=DAILY_BUDGET, exits=ex, **{k: v for k, v in day.items() if k not in ("date", "open")},
                      open=open_t, agent=agent_stats)
 
     while market.now() < open_t:
@@ -646,6 +646,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
             else:
                 held = (now - dt.datetime.fromisoformat(t["opened"])).total_seconds() / 60
                 t.update(plpc=round(pos["plpc"], 4), pl_usd=round(pos["pl"], 2), entry=pos["entry"])
+                t.setdefault("path", []).append([now.strftime("%H:%M"), round(pos["plpc"], 4)])   # for the app's mini-chart
+                del t["path"][:-240]
                 reason = ("stop-loss" if pos["plpc"] <= ex["sl"] else
                           "take-profit" if pos["plpc"] >= ex["tp"] else
                           "max hold" if held >= ex["hold"] else
