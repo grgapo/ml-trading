@@ -372,6 +372,12 @@ def main() -> int:
     raw = load_raw(args.months, args.symbols.replace(" ", "").split(","), args.synthetic)
     memo: dict = {}
     try:
+        status("checking the simulator against real fills")
+        try:
+            import sim_calibration
+            sim_calibration.main()
+        except Exception as exc:
+            print(f"simulator check skipped: {exc}")
         status("checking the live champion")
         monitor_champion(champion, raw, memo)
         while tonight < args.trials and (deadline is None or dt.datetime.now(NY) < deadline - dt.timedelta(minutes=20)):
