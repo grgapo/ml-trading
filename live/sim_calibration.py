@@ -50,12 +50,14 @@ def minute_bars(symbol: str, day: dt.date, cache: dict) -> pd.DataFrame:
     return cache[key]
 
 
-def realized_sigma(bars: pd.DataFrame, at: pd.Timestamp) -> float | None:
+def realized_sigma(bars: pd.DataFrame, at: pd.Timestamp, step: int = 1) -> float | None:
+    """Annualized realized vol from the last trading day of `step`-minute returns.
+    step=1 is what the simulator uses today; noisy IEX prints inflate it, longer steps damp that."""
     past = bars[bars["ts"] <= at]["close"].to_numpy(float)[-390:]
     if len(past) < 120:
         return None
-    r = np.diff(np.log(past))
-    return float(np.std(r) * math.sqrt(252 * 390))
+    r = np.diff(np.log(past[::step]))
+    return float(np.std(r) * math.sqrt(252 * 390 / step))
 
 
 def years_to_expiry(at: pd.Timestamp, expiry: dt.date) -> float:
@@ -75,7 +77,7 @@ def price_at(bars, at, strike, expiry, call, sigma):
     return float(_bs(spot, strike, years_to_expiry(at, expiry), sigma, call)), spot
 
 
-def evaluate(trades: list[dict], iv_mult: float, spread: float, cache: dict) -> list[dict]:
+def evaluate(trades: list[dict], iv_mult: float, spread: float, cache: dict, step: int = 1) -> list[dict]:
     out = []
     for t in trades:
         c = parse_contract(t["contract"])
@@ -87,7 +89,7 @@ def evaluate(trades: list[dict], iv_mult: float, spread: float, cache: dict) -> 
         bars = minute_bars(u, opened.date(), cache)
         if bars.empty:
             continue
-        sigma0 = realized_sigma(bars, opened)
+        sigma0 = realized_sigma(bars, opened, step)
         if not sigma0:
             continue
         sigma = min(1.2, max(0.08, sigma0 * iv_mult))
@@ -122,17 +124,24 @@ def main() -> int:
     trades = [t for t in trades if t.get("contract") and t.get("entry") and t.get("closed")]
     cache: dict = {}
     current = evaluate(trades, IV_MULT, SPREAD, cache)
-    best = None
+    best, by_step = None, {}
     if current:
-        for iv in np.arange(0.8, 1.81, 0.05):
-            for sp in (0.0, 0.02, 0.04, 0.06, 0.08, 0.12):
-                rows = evaluate(trades, float(iv), sp, cache)
-                if not rows:
-                    continue
-                s = summarize(rows)
-                score = s["entry_abs_err"] + s["ret_abs_err"]          # match both price level and outcome
-                if best is None or score < best[0]:
-                    best = (score, round(float(iv), 2), sp, s)
+        for step in (1, 5, 15):                                   # which volatility estimate matches reality?
+            step_best = None
+            for iv in np.arange(0.2, 1.81, 0.05):
+                for sp in (0.0, 0.02, 0.04, 0.06, 0.08, 0.12):
+                    rows = evaluate(trades, float(iv), sp, cache, step)
+                    if not rows:
+                        continue
+                    s = summarize(rows)
+                    score = s["entry_abs_err"] + s["ret_abs_err"]      # match both price level and outcome
+                    if step_best is None or score < step_best[0]:
+                        step_best = (score, round(float(iv), 2), sp, s)
+            if step_best:
+                by_step[step] = {"iv_mult": step_best[1], "spread": step_best[2], "score": round(step_best[0], 4),
+                                 **step_best[3]}
+                if best is None or step_best[0] < best[0]:
+                    best = (step_best[0], step_best[1], step_best[2], {**step_best[3], "vol_bars_minutes": step})
     now = summarize(current)
     verdict = ("not enough real trades yet" if now["trades"] == 0 else
                f"based on {now['trades']} real trades" + ("" if now["trades"] >= MIN_TRUST else f" (trust it after {MIN_TRUST})"))
@@ -140,6 +149,8 @@ def main() -> int:
         "checked": dt.datetime.now(NY).isoformat(timespec="seconds"),
         "settings": {"iv_mult": IV_MULT, "spread": SPREAD}, "current": now,
         "best_fit": ({"iv_mult": best[1], "spread": best[2], **best[3]} if best else None),
+        "by_vol_estimate": by_step,
+        "edge_of_grid": bool(best and best[1] <= 0.2),
         "trustworthy": now["trades"] >= MIN_TRUST, "verdict": verdict,
         "trades": current[-40:],
     }
@@ -148,8 +159,12 @@ def main() -> int:
     if now["trades"]:
         print(f"{verdict}: simulated entry prices are {now['entry_err_median']:+.1%} off (median), "
               f"returns {now['ret_err_mean']:+.1%} off on average")
+        for step, b in by_step.items():
+            print(f"  vol from {step:>2}-min bars: best IV x{b['iv_mult']}, spread {b['spread']:.0%} -> "
+                  f"entry prices {b['entry_err_median']:+.1%} off, returns {b['ret_err_mean']:+.1%} off (score {b['score']})")
         if best:
-            print(f"best fit: IV x{best[1]}, spread {best[2]:.0%} (now IV x{IV_MULT}, spread {SPREAD:.0%})")
+            print(f"best overall: {best[3]['vol_bars_minutes']}-min bars, IV x{best[1]}, spread {best[2]:.0%} "
+                  f"(simulator now: 1-min bars, IV x{IV_MULT}, spread {SPREAD:.0%})")
     else:
         print(verdict)
     return 0
