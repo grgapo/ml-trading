@@ -180,11 +180,17 @@ def simulate_trade(close: np.ndarray, mins: np.ndarray, i: int, end: int, sigma:
 
 
 def build_dataset(frames: dict[str, pd.DataFrame], sl: float = STOP_LOSS, tp: float = TAKE_PROFIT,
-                  hold: int = MAX_HOLD_MIN, progress: bool = True) -> dict:
-    X, R, TS, SYM, EXIT_TS, ENTRY = [], [], [], [], [], []
+                  hold: int = MAX_HOLD_MIN, progress: bool = True, real: bool = False) -> dict:
+    """real=True: trade the actual option contracts at their real historical minute prices
+    (option_history.py); Black-Scholes only where a contract has no data."""
+    X, R, TS, SYM, EXIT_TS, ENTRY, REAL = [], [], [], [], [], [], []
     days_total = sum(df["date"].nunique() for df in frames.values())
     done, t0 = 0, time.time()
+    client = None
+    if real:
+        import option_history as OH
     for symbol, df in frames.items():
+        sessions = sorted(df["date"].unique())
         mins = (df["ts"].dt.hour * 60 + df["ts"].dt.minute - 570).to_numpy()
         close = df["close"].to_numpy(float)
         logret = np.diff(np.log(close), prepend=np.log(close[0]))
@@ -193,10 +199,23 @@ def build_dataset(frames: dict[str, pd.DataFrame], sl: float = STOP_LOSS, tp: fl
         rv = (pd.Series(logret).rolling(per_day, min_periods=max(20, per_day // 3)).std().to_numpy()
               * math.sqrt(252 * per_day))
         feats = df[FEATURES].to_numpy(float)
-        for _, idx in df.groupby("date").indices.items():
+        any_sig = (df[SIGNALS].to_numpy() != 0).any(axis=1)
+        for day, idx in df.groupby("date").indices.items():
             idx = np.sort(idx)
             day_end = idx[-1]
-            any_sig = (df[SIGNALS].to_numpy() != 0).any(axis=1)
+            series = None
+            if real:
+                k = sessions.index(day)
+                nxt = sessions[k + 1] if k + 1 < len(sessions) else (pd.Timestamp(day) + pd.offsets.BDay(1)).date()
+                try:
+                    if client is None and day >= OH.FIRST_DAY:
+                        client = OH._client()
+                    series = OH.day_series(OH.fetch_day(symbol, day, nxt, close[idx].min(), close[idx].max(), client))
+                except Exception as exc:
+                    print(f"real option prices unavailable for {symbol} {day}: {exc}")
+                    series = None
+                expiry = {"1dte": nxt, "0dte": day}
+                day_open = pd.Timestamp(dt.datetime.combine(day, dt.time(9, 30)), tz=NY)
             for i in idx:
                 m = mins[i]
                 if m < FIRST_ENTRY_MIN or m > LAST_ENTRY_MIN or not any_sig[i]:
@@ -206,15 +225,29 @@ def build_dataset(frames: dict[str, pd.DataFrame], sl: float = STOP_LOSS, tp: fl
                     f[FEATURES.index("day_gap")] = 0.0
                 if np.isnan(f).any() or np.isnan(rv[i]):
                     continue
-                sigma = float(np.clip(rv[i] * IV_MULT, 0.08, 1.2))
-                end = min(day_end, i + hold)                     # enough bars for any bar size
-                outs = [simulate_trade(close, mins, i, end, sigma, a, sl, tp, hold) for a in TRADE_ACTIONS]
-                if any(o is None for o in outs):
-                    continue
+                outs, used_real = None, False
+                if series:
+                    strike = round(close[i])
+                    rr = []
+                    for a in TRADE_ACTIONS:
+                        kind, dte = a.split("_")
+                        c = OH.occ(symbol, expiry[dte], kind == "call", strike)
+                        r = OH.simulate_real(series.get(c), int(m) + step - 1, hold, sl, tp, FLATTEN_MIN, SPREAD)
+                        rr.append(None if r is None else (r[0], (day_open + pd.Timedelta(minutes=r[1])).value, r[2]))
+                    if all(o is not None for o in rr):
+                        outs, used_real = rr, True
+                if outs is None:                                 # model price (no real data for this moment)
+                    sigma = float(np.clip(rv[i] * IV_MULT, 0.08, 1.2))
+                    end = min(day_end, i + hold)                 # enough bars for any bar size
+                    bs = [simulate_trade(close, mins, i, end, sigma, a, sl, tp, hold) for a in TRADE_ACTIONS]
+                    if any(o is None for o in bs):
+                        continue
+                    outs = [(o[0], df["ts"].iat[o[1]].value, o[2]) for o in bs]
                 X.append(f)
                 R.append([o[0] for o in outs])
-                EXIT_TS.append([df["ts"].iat[o[1]].value for o in outs])
+                EXIT_TS.append([o[1] for o in outs])
                 ENTRY.append([o[2] for o in outs])
+                REAL.append(used_real)
                 TS.append(df["ts"].iat[i].value)
                 SYM.append(symbol)
             done += 1
@@ -223,8 +256,11 @@ def build_dataset(frames: dict[str, pd.DataFrame], sl: float = STOP_LOSS, tp: fl
                 write_status(phase="simulating trades", symbol=symbol, epoch=done, epochs=days_total,
                              seconds_left=round(rate * (days_total - done)))
     order = np.argsort(TS)
+    if real and REAL:
+        print(f"real option prices for {np.mean(REAL):.0%} of {len(REAL)} decisions (rest: model prices)")
     return {"X": np.array(X)[order], "R": np.array(R)[order], "ts": np.array(TS)[order],
-            "sym": np.array(SYM)[order], "exit_ts": np.array(EXIT_TS)[order], "entry": np.array(ENTRY)[order]}
+            "sym": np.array(SYM)[order], "exit_ts": np.array(EXIT_TS)[order], "entry": np.array(ENTRY)[order],
+            "real": np.array(REAL, dtype=bool)[order]}
 
 
 # ---- 4. models + honest walk-forward test ---------------------------------------------------
@@ -363,7 +399,7 @@ def main() -> int:
                 raw = pd.concat(parts, ignore_index=True)
             frames[symbol] = attach_daily_vol(add_indicators(raw, symbol), daily_vol_table(raw))
         write_status(phase="simulating trades", epoch=0)
-        data = build_dataset(frames)
+        data = build_dataset(frames, real=not args.synthetic)
         if len(data["X"]) < 1000:
             raise RuntimeError(f"only {len(data['X'])} simulated decisions; need more history")
         DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)

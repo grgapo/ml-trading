@@ -67,6 +67,9 @@ def notify(text: str) -> None:
 
 
 # ---- data ------------------------------------------------------------------------------
+SYNTHETIC = False
+
+
 def load_raw(months: int, symbols: list[str], synthetic: bool) -> dict:
     raw = {}
     for s in symbols:
@@ -87,7 +90,8 @@ def dataset_for(p: dict, raw: dict, memo: dict) -> dict:
     else:
         frames = {s: attach_daily_vol(add_indicators(resample(df, p["bar_minutes"]), s), daily_vol_table(df))
                   for s, df in raw.items()}
-        data = build_dataset(frames, p["stop_loss"], p["take_profit"], p["max_hold"], progress=False)
+        data = build_dataset(frames, p["stop_loss"], p["take_profit"], p["max_hold"], progress=False,
+                             real=not SYNTHETIC)
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **data)
     memo.clear()                     # keep memory small on a Pi: one dataset at a time
@@ -368,6 +372,8 @@ def main() -> int:
                      current=current, best=[summarize(e) for e in ranked[:5]],
                      champion=champion, holdout_months=HOLDOUT_MONTHS)
 
+    global SYNTHETIC
+    SYNTHETIC = args.synthetic
     status("loading price history")
     raw = load_raw(args.months, args.symbols.replace(" ", "").split(","), args.synthetic)
     memo: dict = {}

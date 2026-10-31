@@ -21,7 +21,7 @@ FEATURES = [
     # daily volatility regime (GARCH forecast for today vs recent realized volatility)
     "garch_vol", "vol_ratio",
 ]
-FEATURE_VERSION = 3   # bump when inputs change, so cached practice data is rebuilt
+FEATURE_VERSION = 4   # bump when inputs or pricing change, so cached practice data is rebuilt (4: real option prices)
 CONFLUENCE_BARS = 15
 SIGNALS = ["sig_vwap", "sig_ema50", "sig_orb", "sig_fvg"]
 SIGNAL_NAMES = {"sig_vwap": "VWAP cross", "sig_ema50": "50 EMA cross",
