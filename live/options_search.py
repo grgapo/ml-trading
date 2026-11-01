@@ -34,7 +34,7 @@ from options_pretrain import (DAILY_BUDGET, DATA_DIR, EMBARGO_DAYS, MODEL_PATH, 
 from strategy import SIGNAL_SETS, SPACE, VOL_SPLIT, WINDOWS, allowed_actions, dataset_key, describe  # noqa: E402
 
 SEARCH_DIR = STATE_DIR / "search"
-CACHE_DIR = DATA_DIR.parent / "search_cache"
+CACHE_DIR = DATA_DIR.parent / "search_cache"               # + one subfolder per symbol set (per bot)
 LEADERBOARD = SEARCH_DIR / "leaderboard.json"
 CHAMPION = SEARCH_DIR / "champion.json"
 STATUS_PATH = STATE_DIR / "search.json"
@@ -80,11 +80,15 @@ def load_raw(months: int, symbols: list[str], synthetic: bool) -> dict:
     return raw
 
 
+def cache_path(p: dict, symbols) -> Path:
+    return CACHE_DIR / "-".join(sorted(symbols)) / f"{dataset_key(p)}.npz"
+
+
 def dataset_for(p: dict, raw: dict, memo: dict) -> dict:
     key = dataset_key(p)
     if key in memo:
         return memo[key]
-    path = CACHE_DIR / f"{key}.npz"
+    path = cache_path(p, raw)
     if path.exists():
         data = dict(np.load(path))
     else:
@@ -317,7 +321,7 @@ def promote(entry: dict, raw: dict, memo: dict, champion: dict) -> None:
                      if p["use_model"] else (None, None))
     bundle = {"models": models, "features": FEATURES, "strategy": p, "signal_mode": True, "version": 3,
               "min_edge": p["min_edge"] if p["use_model"] else 0.0, "dataset_key": dataset_key(p),
-              "dataset_path": str(CACHE_DIR / f"{dataset_key(p)}.npz"),
+              "dataset_path": str(cache_path(p, raw)),
               "decisions": int(ok.sum()), "description": entry["desc"],
               "conformal_q_low": q_low.tolist() if q_low is not None else None,
               "trained_from": str(pd.Timestamp(data["ts"][0], tz="UTC").tz_convert(NY).date()),

@@ -46,7 +46,7 @@ TRADE_ACTIONS = ACTIONS[1:]
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path.home() / "projects" / "paper-state"))
 DATA_DIR = Path(os.environ.get("BARS_DIR", Path.home() / "projects" / "data" / "bars"))
 MODEL_PATH = STATE_DIR / "options_model.joblib"
-DATASET_PATH = DATA_DIR.parent / "options_dataset.npz"
+DATASET_PATH = STATE_DIR / "options_dataset.npz"          # per bot (each bot has its own STATE_DIR)
 
 STOP_LOSS = float(os.environ.get("OPT_STOP_LOSS", "-0.35"))
 TAKE_PROFIT = float(os.environ.get("OPT_TAKE_PROFIT", "0.50"))
