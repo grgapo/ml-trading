@@ -34,7 +34,13 @@ WALLET, FEE = 10_000.0, 0.0026
 SPLIT = pd.Timestamp("2025-01-01", tz="UTC")
 REGIME_HOURS = [168, 336, 720, 1440, 2400]
 SPACE = {
-    "LabRegime": {"regime_hours": REGIME_HOURS, "band": [0.0, 0.005, 0.01, 0.02, 0.03, 0.04], "pair_filter": [True, False]},
+    "LabRegime": {"regime_hours": REGIME_HOURS, "band": [0.0, 0.005, 0.01, 0.02, 0.03, 0.04], "pair_filter": [True, False],
+                  # always-held share of each coin's wallet (the trend decides only the rest)
+                  "core": [0.0, 0.25, 0.5],
+                  # buy back early when BTC reclaims a RISING shorter average (hours), before the slow one confirms
+                  "fast_reentry": [None, 168, 336],
+                  # invest less in a coin when its last-30-day volatility is above this (annualized)
+                  "vol_target": [None, 0.6, 0.8]},
     "LabTrend": {"atr_mult": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], "breakout_bars": [12, 24, 36, 48, 72, 96, 120],
                  "adx_min": [12, 15, 20, 25, 30, 35], "shock_mult": [3.0, 4.0, 5.0, 6.0, 8.0]},
 }
@@ -57,8 +63,13 @@ def status(**kw) -> None:
 
 def describe(p: dict) -> str:
     if p["strategy"] == "LabRegime":
+        if p.get("core", 0) >= 1:
+            return "just holding (benchmark)"
         return (f"LabRegime · BTC above its {p['regime_hours'] // 24}-day average · band {p['band']:.1%}"
-                + (" · coin trending too" if p["pair_filter"] else ""))
+                + (" · coin trending too" if p["pair_filter"] else "")
+                + (f" · {p['core']:.0%} core" if p.get("core") else "")
+                + (f" · fast re-entry {p['fast_reentry'] // 24}d" if p.get("fast_reentry") else "")
+                + (f" · vol target {p['vol_target']:.0%}" if p.get("vol_target") else ""))
     return (f"LabTrend · {p['breakout_bars']}h breakout · ADX>{p['adx_min']} · stop {p['atr_mult']}×ATR · "
             f"shock {p['shock_mult']}×")
 
@@ -85,6 +96,9 @@ def indicators(frames: dict) -> dict:
         ind[f"btc_ema{h}"] = btc["close"].ewm(span=h, adjust=False, min_periods=h // 2).mean().to_numpy()
     move = btc["close"].pct_change().abs()
     ind["move_ratio"] = (move / move.rolling(168, min_periods=48).mean()).to_numpy()
+    for h in (168, 336):                                  # fast averages for early re-entry, and whether they're rising
+        e = btc["close"].ewm(span=h, adjust=False, min_periods=h // 2).mean()
+        ind[f"btc_fast{h}"] = e.to_numpy(); ind[f"btc_fast{h}_up"] = (e > e.shift(24)).to_numpy()
     ind["btc_risk_on"] = (btc["close"] > btc["close"].ewm(span=200, adjust=False, min_periods=200).mean()).to_numpy()
     for pair, df in frames.items():
         c, h, l = df["close"], df["high"], df["low"]
@@ -105,6 +119,7 @@ def indicators(frames: dict) -> dict:
             "atr": atr.to_numpy(), "adx": adx.to_numpy(), "rsi": (100 - 100 / (1 + rs)).to_numpy(),
             **{f"ema{hh}": c.ewm(span=hh, adjust=False, min_periods=hh // 2).mean().to_numpy() for hh in REGIME_HOURS},
             "hh": {}, "high_s": h,
+            "vol30": (c.pct_change().rolling(720, min_periods=240).std() * np.sqrt(24 * 365)).to_numpy(),
         }
     return ind
 
@@ -127,8 +142,67 @@ def signals(ind: dict, pair: str, p: dict) -> tuple[np.ndarray, np.ndarray]:
     return enter, x["close"] < x["ema50"]
 
 
+def simulate_regime(ind: dict, p: dict, start: pd.Timestamp, end: pd.Timestamp | None):
+    """Trend family with target exposure per coin: core + (1 - core) x [in trend] x [volatility size].
+    Rebalances at the next hour's open when the target moves by more than 10 percentage points
+    (avoids fee churn); partial buys/sells pay the fee; realized P&L uses average cost."""
+    dates = ind["date"]
+    lo = int(np.searchsorted(ind["ns"], start.value)); hi = len(dates) if end is None else int(np.searchsorted(ind["ns"], end.value))
+    months = dates.dt.strftime("%Y-%m").to_numpy(); days = dates.dt.strftime("%Y-%m-%d").to_numpy()
+    monthly, daily, trades, exposure = {}, {}, [], {}
+    h, b, core = p["regime_hours"], p["band"], float(p.get("core") or 0)
+    bc, be = ind["btc_close"], ind[f"btc_ema{h}"]
+    fast = p.get("fast_reentry")
+    for pair in PAIRS:
+        x = ind[pair]; e = x[f"ema{h}"]
+        cash = WALLET / len(PAIRS); units = 0.0; avg = 0.0; on = False; value_prev = cash
+        o, c = x["open"], x["close"]
+        for i in range(max(lo, 1), hi):
+            if np.isnan(o[i]):
+                continue
+            k = i - 1                                          # decide on the last completed hour
+            if np.isfinite(be[k]):
+                enter = bc[k] > be[k] * (1 + b) and (not p["pair_filter"] or c[k] > e[k])
+                if fast and not enter:
+                    enter = bc[k] > ind[f"btc_fast{fast}"][k] and bool(ind[f"btc_fast{fast}_up"][k]) and (not p["pair_filter"] or c[k] > e[k])
+                leave = bc[k] < be[k] * (1 - b) or (p["pair_filter"] and c[k] < e[k] * (1 - b))
+                if fast and leave and bc[k] > ind[f"btc_fast{fast}"][k] and bool(ind[f"btc_fast{fast}_up"][k]):
+                    leave = False
+                on = True if enter else (False if leave else on)
+            size = 1.0
+            if p.get("vol_target") and np.isfinite(x["vol30"][k]) and x["vol30"][k] > 0:
+                size = min(1.0, p["vol_target"] / x["vol30"][k])
+            target = min(1.0, core + (1 - core) * (1.0 if on else 0.0) * size)
+            value = cash + units * o[i]
+            current = units * o[i] / value if value > 0 else 0.0
+            if abs(target - current) > 0.10 or (target == 0 and units > 0) or (target >= 0.999 and current < 0.9):
+                want = target * value
+                if want > units * o[i]:                         # buy the difference
+                    spend = min(cash, want - units * o[i]); got = spend * (1 - FEE) / o[i]
+                    avg = (avg * units + spend) / (units + got) if units + got > 0 else 0.0
+                    units += got; cash -= spend
+                    trades.append({"t": dates.iloc[i].isoformat(), "sym": pair.split("/")[0], "trade": f"buy → {target:.0%} invested",
+                                   "pnl": 0.0, "pct": 0.0, "kind": "buy"})
+                else:                                           # sell the difference
+                    sell_units = min(units, (units * o[i] - want) / o[i])
+                    proceeds = sell_units * o[i] * (1 - FEE); pnl = proceeds - sell_units * avg
+                    units -= sell_units; cash += proceeds
+                    trades.append({"t": dates.iloc[i].isoformat(), "sym": pair.split("/")[0], "trade": f"sell → {target:.0%} invested",
+                                   "pnl": round(pnl, 2), "pct": round(100 * (proceeds / max(sell_units * avg, 1e-9) - 1), 1), "kind": "sell"})
+            value = cash + units * c[i]
+            monthly[months[i]] = monthly.get(months[i], 0.0) + (value - value_prev)
+            daily[days[i]] = daily.get(days[i], 0.0) + (value - value_prev)
+            value_prev = value
+        exposure[pair.split("/")[0]] = round(units * c[hi - 1] / max(cash + units * c[hi - 1], 1e-9), 3) if hi > lo else 0.0
+    sells = [t for t in trades if t["kind"] == "sell"]
+    return monthly, sells or trades, daily, exposure
+
+
 def simulate(ind: dict, p: dict, start: pd.Timestamp, end: pd.Timestamp | None):
     """Run one variation between start and end. Returns (monthly $ P&L dict, trades list, equity end)."""
+    if p["strategy"] == "LabRegime":
+        monthly, trades, _daily, _exp = simulate_regime(ind, p, start, end)
+        return monthly, trades
     dates = ind["date"]
     lo = int(np.searchsorted(ind["ns"], start.value))
     hi = len(dates) if end is None else int(np.searchsorted(ind["ns"], end.value))
