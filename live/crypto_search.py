@@ -49,7 +49,9 @@ def write(path: Path, data) -> None:
 
 
 def status(**kw) -> None:
+    import socket
     STATUS.update(kw); STATUS["updated"] = dt.datetime.now(NY).isoformat(timespec="seconds")
+    STATUS["host"] = socket.gethostname()
     write(STATE_DIR / "search.json", STATUS)
 
 

@@ -244,7 +244,9 @@ def summarize(entry: dict) -> dict:
 
 
 def write_status(**info) -> None:
+    import socket
     info["updated"] = dt.datetime.now(NY).isoformat(timespec="seconds")
+    info["host"] = socket.gethostname()            # which machine is searching (lab03, lab01, ...)
     save_json(STATUS_PATH, info)
 
 
