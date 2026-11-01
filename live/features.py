@@ -15,7 +15,7 @@ FEATURES = [
     "range_pos", "day_gap", "minutes_since_open", "minutes_to_close", "is_qqq",
     # signal context (meta-labeling): which setup fired, its direction, and its shape
     "price_vs_ema50", "ema50_slope", "or_size_pct", "or_pos",
-    "sig_vwap", "sig_ema50", "sig_orb", "sig_fvg", "signal_dir",
+    "sig_vwap", "sig_ema50", "sig_orb", "sig_fvg", "sig_orbnb", "signal_dir",
     # confluence: how many DIFFERENT setups agree (bullish / bearish) within the last 15 bars
     "conf_bull", "conf_bear",
     # daily volatility regime (GARCH forecast for today vs recent realized volatility)
@@ -24,12 +24,13 @@ FEATURES = [
     # 1-year median) and today's scheduled events (Fed decision, CPI, jobs report)
     "vix_level", "vix_chg5", "vix_rel", "fomc_day", "cpi_day", "jobs_day",
 ]
-FEATURE_VERSION = 5   # bump when inputs or pricing change, so cached practice data is rebuilt (5: market context)
+FEATURE_VERSION = 6   # bump when inputs or pricing change, so cached practice data is rebuilt (6: ORB+noise band setup)
 DAILY_COLS = ["garch_vol", "vol_ratio", "vix_level", "vix_chg5", "vix_rel", "fomc_day", "cpi_day", "jobs_day", "event_day"]
 CONFLUENCE_BARS = 15
-SIGNALS = ["sig_vwap", "sig_ema50", "sig_orb", "sig_fvg"]
+SIGNALS = ["sig_vwap", "sig_ema50", "sig_orb", "sig_fvg", "sig_orbnb"]
 SIGNAL_NAMES = {"sig_vwap": "VWAP cross", "sig_ema50": "50 EMA cross",
-                "sig_orb": "opening-range breakout", "sig_fvg": "FVG retest"}
+                "sig_orb": "opening-range breakout", "sig_fvg": "FVG retest",
+                "sig_orbnb": "opening range + noise band + VWAP"}
 OPENING_RANGE_MIN = 15
 
 
@@ -135,6 +136,39 @@ def add_signals(df: pd.DataFrame) -> None:
     first_up = (up == 1) & (up.groupby(day).cumsum() == 1)
     first_dn = (dn == 1) & (dn.groupby(day).cumsum() == 1)
     df["sig_orb"] = first_up.astype(int) - first_dn.astype(int)
+
+    # 5. Opening range + noise band + VWAP ("ORB+NB", the strategy from the opening-range backtest):
+    #    at the checks every 10 minutes from 10:00 to 14:00, a close beyond the opening range by
+    #    0.3 x the 5-minute ATR(14), beyond the noise band (how far price usually strays from the open
+    #    by this time of day, last 14 days) and beyond VWAP. At most once a day.
+    t = df["ts"]
+    so = since_open.to_numpy()
+    steps = np.diff(so)[np.diff(so) > 0]
+    step = int(np.median(steps)) if len(steps) else 1
+    b5 = t.dt.floor("5min")
+    g5 = df.groupby(b5)
+    o5 = pd.DataFrame({"h": g5["high"].max(), "l": g5["low"].min(), "c": g5["close"].last()})
+    pc5 = o5["c"].shift(1)
+    tr5 = pd.concat([o5["h"] - o5["l"], (o5["h"] - pc5).abs(), (o5["l"] - pc5).abs()], axis=1).max(axis=1)
+    atr5 = tr5.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    ends = pd.DataFrame({"known_at": t + pd.Timedelta(minutes=step) - pd.Timedelta(minutes=5)})
+    right = pd.DataFrame({"bucket": atr5.index, "atr5": atr5.to_numpy()})
+    df["atr5"] = pd.merge_asof(ends, right, left_on="known_at", right_on="bucket", direction="backward")["atr5"].to_numpy()
+    day_open = df.groupby(day)["open"].transform("first")
+    prev_close = day.map(df.groupby(day)["close"].last().shift(1)).fillna(day_open)
+    move = (c / day_open - 1).abs()
+    piv = pd.DataFrame({"date": day, "slot": since_open, "move": move}).pivot_table(index="date", columns="slot", values="move")
+    sigma = piv.rolling(14, min_periods=14).mean().shift(1).stack()
+    sig_v = sigma.reindex(pd.MultiIndex.from_arrays([day, since_open])).to_numpy()
+    upper = np.maximum(day_open, prev_close) * (1 + sig_v)
+    lower = np.minimum(day_open, prev_close) * (1 - sig_v)
+    end_min = since_open + step
+    check = (end_min % 10 == 0) & (end_min >= 30) & (end_min <= 270)
+    up = check & (c > or_hi + 0.3 * df["atr5"]) & (c > upper) & (c > df["vwap"])
+    dn = check & (c < or_lo - 0.3 * df["atr5"]) & (c < lower) & (c < df["vwap"])
+    anyx = (up | dn)
+    first = anyx & (anyx.astype(int).groupby(day).cumsum() == 1)
+    df["sig_orbnb"] = (first & up).astype(int) - (first & dn).astype(int)
 
     # 4. FVG retest: a fair value gap forms, then price comes back into it and holds.
     #    Bullish gap = this bar's low above the high 2 bars back; signal when a later bar

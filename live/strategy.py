@@ -27,6 +27,13 @@ SPACE = {
     "event_filter": ["off", "skip", "only"],
     # VIX vs its 1-year median: any, calmer than usual, or more nervous than usual
     "vix_filter": ["off", "low", "high"],
+    # how a trade ends: quick option exits (stop / target / max hold above) or ATR exits on the
+    # underlying (after 4 ATR its way, sell on giving back half; 10 ATR safety stop; out at 3:45)
+    "exit_style": ["option", "atr"],
+    # which contract: at the money, or about $2 in the money
+    "moneyness": ["atm", "itm2"],
+    # the calm-day predictor (trend_days.py, walk-forward): any day, calm days only, trend days only
+    "day_filter": ["off", "calm", "trend"],
 }
 VOL_SPLIT = 1.0   # vol_ratio above this = volatility expected to rise ("volatile")
 SIGNAL_SETS = [list(c) for n in range(1, len(SIGNALS) + 1) for c in itertools.combinations(SIGNALS, n)]
@@ -35,7 +42,7 @@ SIGNAL_SETS = [list(c) for n in range(1, len(SIGNALS) + 1) for c in itertools.co
 _DIR_ACTIONS = {1: {"1dte": [0], "0dte": [2], "both": [0, 2]},
                 -1: {"1dte": [1], "0dte": [3], "both": [1, 3]}}
 
-SHORT = {"sig_vwap": "VWAP", "sig_ema50": "EMA50", "sig_orb": "ORB", "sig_fvg": "FVG"}
+SHORT = {"sig_vwap": "VWAP", "sig_ema50": "EMA50", "sig_orb": "ORB", "sig_fvg": "FVG", "sig_orbnb": "ORB+NB"}
 
 
 def allowed_actions(direction: int, dte: str) -> list[int]:
@@ -52,15 +59,35 @@ def describe(p: dict) -> str:
     if (p.get("confluence") or 1) > 1:
         pick += f" · {p['confluence']}+ agree"
     ev, vx = p.get("event_filter", "off"), p.get("vix_filter", "off")
-    return (f"{p['bar_minutes']}m · {sigs} · SL{p['stop_loss']:.0%} TP+{p['take_profit']:.0%} · "
-            f"{p['max_hold']}min · {p['dte'].upper()} · {p['window']} · {pick}"
-            + (f" · {vol} days" if vol not in (None, "off") else "")
+    exits = ("ATR exits" if p.get("exit_style") == "atr"
+             else f"SL{p['stop_loss']:.0%} TP+{p['take_profit']:.0%} · {p['max_hold']}min")
+    df_ = p.get("day_filter", "off")
+    return (f"{p['bar_minutes']}m · {sigs} · {exits} · {p['dte'].upper()}"
+            + (" · $2 ITM" if p.get("moneyness") == "itm2" else "")
+            + f" · {p['window']} · {pick}"
+            + ({"calm": " · calm days only", "trend": " · trend days only"}.get(df_, ""))
+            + ({"calm": " · low vol forecast", "volatile": " · high vol forecast"}.get(vol, ""))
             + ({"skip": " · skip event days", "only": " · event days only"}.get(ev, ""))
             + ({"low": " · VIX below usual", "high": " · VIX above usual"}.get(vx, "")))
 
 
 def dataset_key(p: dict) -> str:
-    return f"v{FEATURE_VERSION}_b{p['bar_minutes']}_sl{p['stop_loss']}_tp{p['take_profit']}_h{p['max_hold']}"
+    exits = "xatr" if p.get("exit_style") == "atr" else f"sl{p['stop_loss']}_tp{p['take_profit']}_h{p['max_hold']}"
+    return f"v{FEATURE_VERSION}_b{p['bar_minutes']}_{exits}" + ("_itm2" if p.get("moneyness") == "itm2" else "")
+
+
+def needs_live_support(p: dict) -> list[str]:
+    """Pieces of a variation the live options bot can't execute yet (so it mustn't be auto-promoted)."""
+    out = []
+    if p.get("exit_style") == "atr":
+        out.append("ATR exits")
+    if p.get("moneyness") == "itm2":
+        out.append("in-the-money strikes")
+    if p.get("day_filter", "off") != "off":
+        out.append("the calm-day filter")
+    if "sig_orbnb" in (p.get("signals") or []):
+        out.append("the ORB+noise band setup")
+    return out
 
 
 def confluence_ok(direction: int, conf_bull: float, conf_bear: float, need) -> bool:

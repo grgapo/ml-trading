@@ -185,10 +185,29 @@ def simulate_trade(close: np.ndarray, mins: np.ndarray, i: int, end: int, sigma:
     return float(max(-1.0, min(1.5, plpc[k]))), int(j[k]), entry
 
 
+def atr_exit_bar(close: np.ndarray, mins: np.ndarray, i: int, day_end: int, atr: float, sgn: int, step: int,
+                 trigger: float = 4.0, giveback: float = 0.5, stop: float = 10.0) -> int:
+    """ATR exits on the underlying: after `trigger` ATR its way sell on giving back `giveback` of the best
+    move; safety stop at `stop` ATR against; otherwise the last bar ending by 15:45."""
+    entry, best = close[i], 0.0
+    for j in range(i + 1, day_end + 1):
+        if mins[j] + step - 1 >= FLATTEN_MIN:
+            return j
+        gain = sgn * (close[j] - entry)
+        best = max(best, gain)
+        if gain <= -stop * atr or (best >= trigger * atr and gain <= (1 - giveback) * best):
+            return j
+    return day_end
+
+
 def build_dataset(frames: dict[str, pd.DataFrame], sl: float = STOP_LOSS, tp: float = TAKE_PROFIT,
-                  hold: int = MAX_HOLD_MIN, progress: bool = True, real: bool = False) -> dict:
+                  hold: int = MAX_HOLD_MIN, progress: bool = True, real: bool = False,
+                  exit_style: str = "option", moneyness: str = "atm") -> dict:
     """real=True: trade the actual option contracts at their real historical minute prices
-    (option_history.py); Black-Scholes only where a contract has no data."""
+    (option_history.py); Black-Scholes only where a contract has no data.
+    exit_style "atr": exits managed on the underlying in ATR units (see atr_exit_bar);
+    moneyness "itm2": strikes about $2 in the money (calls below, puts above the price)."""
+    atr_mode, itm = exit_style == "atr", (2 if moneyness == "itm2" else 0)
     X, R, TS, SYM, EXIT_TS, ENTRY, REAL = [], [], [], [], [], [], []
     days_total = sum(df["date"].nunique() for df in frames.values())
     done, t0 = 0, time.time()
@@ -206,6 +225,7 @@ def build_dataset(frames: dict[str, pd.DataFrame], sl: float = STOP_LOSS, tp: fl
               * math.sqrt(252 * per_day))
         feats = df[FEATURES].to_numpy(float)
         any_sig = (df[SIGNALS].to_numpy() != 0).any(axis=1)
+        atr5 = df["atr5"].to_numpy(float) if "atr5" in df else np.full(len(df), np.nan)
         for day, idx in df.groupby("date").indices.items():
             idx = np.sort(idx)
             day_end = idx[-1]
@@ -229,26 +249,61 @@ def build_dataset(frames: dict[str, pd.DataFrame], sl: float = STOP_LOSS, tp: fl
                 f = feats[i].copy()
                 if np.isnan(f[FEATURES.index("day_gap")]):
                     f[FEATURES.index("day_gap")] = 0.0
+                for col in ("vix_level", "vix_chg5", "vix_rel"):      # no VIX history: neutral, don't drop the trade
+                    if col in FEATURES and np.isnan(f[FEATURES.index(col)]):
+                        f[FEATURES.index(col)] = 0.0
                 if np.isnan(f).any() or np.isnan(rv[i]):
                     continue
                 outs, used_real = None, False
+                if atr_mode and not np.isfinite(atr5[i]):
+                    continue
+                exit_bar = {}
+                if atr_mode:                                     # exit time depends on direction, not on the contract
+                    for sgn in (1, -1):
+                        exit_bar[sgn] = atr_exit_bar(close, mins, i, day_end, float(atr5[i]), sgn, step)
                 if series:
-                    strike = round(close[i])
                     rr = []
                     for a in TRADE_ACTIONS:
                         kind, dte = a.split("_")
+                        strike = round(close[i]) - itm if kind == "call" else round(close[i]) + itm
                         c = OH.occ(symbol, expiry[dte], kind == "call", strike)
-                        r = OH.simulate_real(series.get(c), int(m) + step - 1, hold, sl, tp, FLATTEN_MIN, SPREAD)
-                        rr.append(None if r is None else (r[0], (day_open + pd.Timedelta(minutes=r[1])).value, r[2]))
+                        ser = series.get(c)
+                        if atr_mode:
+                            m0 = int(m) + step - 1
+                            j = exit_bar[1 if kind == "call" else -1]
+                            m1 = int(min(mins[j] + step - 1, FLATTEN_MIN))
+                            if ser is None or m0 + 1 >= 390 or not np.isfinite(ser[m0 + 1]) or ser[m0 + 1] < 0.05 or not np.isfinite(ser[m1]):
+                                rr.append(None); continue
+                            buy, sell = ser[m0 + 1] * (1 + SPREAD / 2), ser[m1] * (1 - SPREAD / 2)
+                            rr.append((float(max(-1.0, min(3.0, sell / buy - 1))), (day_open + pd.Timedelta(minutes=m1)).value, buy))
+                        else:
+                            r = OH.simulate_real(ser, int(m) + step - 1, hold, sl, tp, FLATTEN_MIN, SPREAD)
+                            rr.append(None if r is None else (r[0], (day_open + pd.Timedelta(minutes=r[1])).value, r[2]))
                     if all(o is not None for o in rr):
                         outs, used_real = rr, True
                 if outs is None:                                 # model price (no real data for this moment)
                     sigma = float(np.clip(rv[i] * IV_MULT, 0.08, 1.2))
-                    end = min(day_end, i + hold)                 # enough bars for any bar size
-                    bs = [simulate_trade(close, mins, i, end, sigma, a, sl, tp, hold) for a in TRADE_ACTIONS]
-                    if any(o is None for o in bs):
-                        continue
-                    outs = [(o[0], df["ts"].iat[o[1]].value, o[2]) for o in bs]
+                    if atr_mode:
+                        bs = []
+                        for a in TRADE_ACTIONS:
+                            kind, dte = a.split("_")
+                            call = kind == "call"
+                            K = round(close[i]) - itm if call else round(close[i]) + itm
+                            j = exit_bar[1 if call else -1]
+                            extra = 390 if dte == "1dte" else 0
+                            T0 = max(390 - mins[i] + extra, 1) / (252 * 390); T1 = max(390 - mins[j] + extra, 1) / (252 * 390)
+                            p0 = float(_bs(close[i], K, T0, sigma, call)) * (1 + SPREAD / 2)
+                            p1 = float(_bs(close[j], K, T1, sigma, call)) * (1 - SPREAD / 2)
+                            bs.append(None if p0 < 0.05 else (float(max(-1.0, min(3.0, p1 / p0 - 1))), df["ts"].iat[j].value, p0))
+                        if any(o is None for o in bs):
+                            continue
+                        outs = bs
+                    else:
+                        end = min(day_end, i + hold)                 # enough bars for any bar size
+                        bs = [simulate_trade(close, mins, i, end, sigma, a, sl, tp, hold) for a in TRADE_ACTIONS]
+                        if any(o is None for o in bs):
+                            continue
+                        outs = [(o[0], df["ts"].iat[o[1]].value, o[2]) for o in bs]
                 X.append(f)
                 R.append([o[0] for o in outs])
                 EXIT_TS.append([o[1] for o in outs])

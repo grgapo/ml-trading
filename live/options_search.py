@@ -31,7 +31,7 @@ from features import FEATURES, SIGNALS, add_indicators, attach_daily_vol, daily_
 from options_pretrain import (DAILY_BUDGET, DATA_DIR, EMBARGO_DAYS, MODEL_PATH, NY, STATE_DIR,  # noqa: E402
                               build_dataset, download_month, fit_models, month_list, predict,
                               synthetic_bars, trade_month)
-from strategy import SIGNAL_SETS, SPACE, VOL_SPLIT, WINDOWS, allowed_actions, dataset_key, describe  # noqa: E402
+from strategy import SIGNAL_SETS, SPACE, VOL_SPLIT, WINDOWS, allowed_actions, dataset_key, describe, needs_live_support  # noqa: E402
 
 SEARCH_DIR = STATE_DIR / "search"
 CACHE_DIR = DATA_DIR.parent / "search_cache"               # + one subfolder per symbol set (per bot)
@@ -95,12 +95,40 @@ def dataset_for(p: dict, raw: dict, memo: dict) -> dict:
         frames = {s: attach_daily_vol(add_indicators(resample(df, p["bar_minutes"]), s), daily_vol_table(df))
                   for s, df in raw.items()}
         data = build_dataset(frames, p["stop_loss"], p["take_profit"], p["max_hold"], progress=False,
-                             real=not SYNTHETIC)
+                             real=not SYNTHETIC, exit_style=p.get("exit_style", "option"),
+                             moneyness=p.get("moneyness", "atm"))
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **data)
+    # each practice trade's day, rated calm (1) / trend (0) by the walk-forward calm-day predictor
+    days = pd.to_datetime(data["ts"], utc=True).tz_convert(NY).date
+    data["calm"] = np.array([CALM.get((str(sym), d), np.nan) for sym, d in zip(data["sym"], days)], dtype=float)
     memo.clear()                     # keep memory small on a Pi: one dataset at a time
     memo[key] = data
     return data
+
+
+CALM: dict = {}
+
+
+def load_calm_days(symbols: list[str]) -> None:
+    """Rate every past day calm/trend with the trend-day predictor, walk-forward (each month predicted
+    by a model trained only on earlier months); calm = predicted trend chance at or below the median
+    of all earlier predictions (the proving ground's rule). Days it can't rate stay unknown."""
+    try:
+        import features as F
+        import orb_backtest as ORB
+        import trend_days as TD
+        vix = F.vix_daily()
+        df = TD.walk_forward(pd.concat([TD.build(s, ORB.load_days(s), vix) for s in symbols], ignore_index=True))
+        te = df.dropna(subset=["p_logit"]).sort_values("date").reset_index(drop=True)
+        for k, r in te.iterrows():
+            if k < 20:
+                continue
+            thr = float(te["p_logit"].iloc[:k].median())
+            CALM[(r["symbol"], r["date"])] = 1.0 if r["p_logit"] <= thr else 0.0
+        print(f"calm-day ratings for {len(CALM)} symbol-days ({sum(CALM.values()) / max(len(CALM), 1):.0%} calm)", flush=True)
+    except Exception as exc:
+        print(f"calm-day ratings unavailable ({type(exc).__name__}: {exc}); the calm-day filter will skip", flush=True)
 
 
 def qualify(data: dict, p: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -128,6 +156,13 @@ def qualify(data: dict, p: dict) -> tuple[np.ndarray, np.ndarray]:
         vx = X[:, COL["vix_rel"]]
         known = ~np.isnan(vx)
         ok &= ~known | ((vx <= 0) if xf == "low" else (vx > 0))
+    dfl = p.get("day_filter", "off")
+    if dfl not in (None, "off"):
+        calm = data.get("calm")
+        if calm is None:
+            ok &= False
+        else:
+            ok &= (calm == 1) if dfl == "calm" else (calm == 0)
     return ok, direction
 
 
@@ -230,6 +265,8 @@ def sample(rng: random.Random) -> dict:
     if not p["use_model"]:
         p["min_edge"] = None
         p["confidence"] = "off"
+    if p["exit_style"] == "atr":                    # the quick-exit settings don't apply
+        p["stop_loss"] = p["take_profit"] = p["max_hold"] = None
     return p
 
 
@@ -391,6 +428,9 @@ def main() -> int:
     SYNTHETIC = args.synthetic
     status("loading price history")
     raw = load_raw(args.months, args.symbols.replace(" ", "").split(","), args.synthetic)
+    if not args.synthetic:
+        status("rating past days calm / trend")
+        load_calm_days(args.symbols.replace(" ", "").split(","))
     memo: dict = {}
     try:
         status("checking the simulator against real fills")
@@ -433,8 +473,17 @@ def main() -> int:
             save_json(LEADERBOARD, board)
             if best["holdout"]["pnl"] > max(0.0, champion.get("holdout_pnl") or 0.0) and \
                     best["holdout"]["trades"] >= MIN_TRADES // 3:
-                status("promoting a new champion")
-                promote(best, raw, memo, champion)
+                missing = needs_live_support(best["params"])
+                if missing:                                 # passed, but the live bot can't run it yet
+                    champion["pending"] = {"desc": best["desc"], "params": best["params"], "holdout_pnl": best["holdout"]["pnl"],
+                                           "holdout_trades": best["holdout"]["trades"], "needs": missing,
+                                           "found": dt.datetime.now(NY).isoformat(timespec="seconds")}
+                    notify(f"A variation passed the locked test but the live bot needs {', '.join(missing)} before it can "
+                           f"trade it: {best['desc']} (holdout {best['holdout']['pnl']:+,.0f} over {best['holdout']['trades']} trades). "
+                           f"Ask Claude to add live support.")
+                else:
+                    status("promoting a new champion")
+                    promote(best, raw, memo, champion)
             save_json(CHAMPION, champion)
         status("idle until tomorrow night")
         return 0
