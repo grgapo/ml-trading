@@ -16,6 +16,9 @@ Rules (from the strategy Greg found; gaps filled with standard choices, marked [
 Also: the same signals traded with plain shares (is the edge in the signal or the options?), and a
 sensitivity grid around every setting (robust edge vs one lucky combination).
 
+Variant tested side by side: VWAP exit - also sell when a 1-minute candle closes back on the wrong side
+of VWAP (the condition that justified the entry is gone), instead of holding a stalled trade to 3:45.
+
   .venv/bin/python live/orb_backtest.py --symbols SPY QQQ
 """
 from __future__ import annotations
@@ -97,7 +100,8 @@ def signal(d: dict, band_atr: float):
     return None
 
 
-def manage(d: dict, m: int, side: str, atr: float, trigger: float, giveback: float, stop: float):
+def manage(d: dict, m: int, side: str, atr: float, trigger: float, giveback: float, stop: float,
+           vwap_exit: bool = False):
     """Exit minute + reason, managed on the underlying in ATR units."""
     sgn = 1 if side == "call" else -1
     entry = d["c"][m]
@@ -107,6 +111,8 @@ def manage(d: dict, m: int, side: str, atr: float, trigger: float, giveback: flo
         best = max(best, gain)
         if gain <= -stop * atr:
             return j, "safety stop"
+        if vwap_exit and sgn * (d["c"][j] - d["vwap"][j]) < 0:
+            return j, "lost VWAP"
         if best >= trigger * atr and gain <= (1 - giveback) * best:
             return j, "gave back half"
     return FLAT, "3:45 exit"
@@ -119,7 +125,7 @@ def run(days, sym, series_cache, sessions, p):
         if not sg:
             continue
         m, side, atr = sg
-        j, why = manage(d, m, side, atr, p["trigger"], p["giveback"], p["stop"])
+        j, why = manage(d, m, side, atr, p["trigger"], p["giveback"], p["stop"], p.get("vwap_exit", False))
         spot = d["c"][m - 1]
         strike = round(spot - 2) if side == "call" else round(spot + 2)          # ~$2 in the money
         k = sessions.index(d["date"])
@@ -153,12 +159,11 @@ def summary(trades):
 
 def main() -> int:
     ap = argparse.ArgumentParser(); ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ"]); args = ap.parse_args()
-    base = {"band": 0.3, "trigger": 4.0, "giveback": 0.5, "stop": 10.0, "spread": SPREAD}
+    base = {"band": 0.3, "trigger": 4.0, "giveback": 0.5, "stop": 10.0, "spread": SPREAD, "vwap_exit": False}
     client = None
-    out = {"rules": base, "stake": STAKE, "symbols": {}, "grid": None}
-    all_days = {}
+    data = {}
     for sym in args.symbols:
-        days = load_days(sym); all_days[sym] = days
+        days = load_days(sym)
         sessions = [d["date"] for d in days]
         cache: dict = {}
 
@@ -174,57 +179,49 @@ def main() -> int:
                 except Exception as exc:
                     print(f"no option prices for {sym} {d['date']}: {exc}"); cache[key] = {}
             return cache[key].get(OH.occ(sym, expiry, side == "call", strike))
+        data[sym] = (days, series, sessions)
         print(f"{sym}: {len(days)} trading days {days[0]['date']} -> {days[-1]['date']}", flush=True)
-        trades = run(days, sym, series, sessions, base)
-        s = summary(trades)
-        by_month = {}
-        for x in trades:
-            if x["pnl"] is not None:
-                by_month[x["date"][:7]] = round(by_month.get(x["date"][:7], 0) + x["pnl"], 2)
-        reasons = {}
-        for x in trades:
-            if x["pnl"] is not None:
-                r = reasons.setdefault(x["why"], [0, 0.0]); r[0] += 1; r[1] = round(r[1] + x["pnl"], 2)
-        out["symbols"][sym] = {"summary": s, "by_month": by_month, "exits": reasons, "signal_days": len(trades),
-                               "no_option_data": sum(1 for x in trades if x["pnl"] is None), "trades": trades[-60:]}
-        print(f"  as written: {s}", flush=True)
-        print(f"  exits: {reasons}", flush=True)
-        out["symbols"][sym]["_series"] = series
-        out["symbols"][sym]["_sessions"] = sessions
-    # sensitivity grid: every combination of neighbouring settings
-    grid = []
-    for band, trig, give, stop in itertools.product((0.2, 0.3, 0.4), (3.0, 4.0, 5.0), (0.4, 0.5, 0.6), (8.0, 10.0, 12.0)):
-        p = {**base, "band": band, "trigger": trig, "giveback": give, "stop": stop}
-        tot = 0.0; n = 0
-        for sym in args.symbols:
-            s = summary(run(all_days[sym], sym, out["symbols"][sym]["_series"], out["symbols"][sym]["_sessions"], p))
-            tot += s.get("total", 0); n += s.get("trades", 0)
-        grid.append({"band": band, "trigger": trig, "giveback": give, "stop": stop, "total": round(tot, 2), "trades": n})
-    totals = np.array([g["total"] for g in grid])
-    out["grid"] = {"combos": len(grid), "profitable_share": round(float((totals > 0).mean()), 3),
-                   "median_total": round(float(np.median(totals)), 2), "best": max(grid, key=lambda g: g["total"]),
-                   "worst": min(grid, key=lambda g: g["total"]), "all": grid}
-    for sym in args.symbols:
-        out["symbols"][sym].pop("_series"); out["symbols"][sym].pop("_sessions")
-    STATE.mkdir(parents=True, exist_ok=True)
-    out["updated"] = dt.datetime.now(NY).isoformat(timespec="seconds")
-    (STATE / "results.json").write_text(json.dumps(out, default=str))
 
-    print("\n================ opening-range breakout: results ================")
-    for sym, r in out["symbols"].items():
-        s = r["summary"]
-        if not s.get("trades"):
-            print(f"{sym}: no trades with option data"); continue
-        print(f"{sym}: {s['trades']} trades on {r['signal_days']} signal days · win rate {s['win_rate']:.0%} · "
-              f"total ${s['total']:+,.0f} · avg win ${s['avg_win']:,.0f} / avg loss ${s['avg_loss']:,.0f} · "
-              f"profit factor {s['profit_factor']} · worst drawdown ${s['max_drawdown']:,.0f}")
-        print(f"      same signals with shares instead of options: {s['shares_total_pct']:+.1f}% summed")
-        months = r["by_month"]; green = sum(1 for v in months.values() if v > 0)
-        print(f"      months: {green}/{len(months)} green · " + "  ".join(f"{k[2:]}:{v:+,.0f}" for k, v in sorted(months.items())))
-    g = out["grid"]
-    print(f"\nrobustness: {g['profitable_share']:.0%} of {g['combos']} nearby settings are profitable · median total ${g['median_total']:+,.0f}")
-    print(f"   best  {g['best']}")
-    print(f"   worst {g['worst']}")
+    out = {"stake": STAKE, "variants": {}, "updated": dt.datetime.now(NY).isoformat(timespec="seconds")}
+    for name, vx in (("as written", False), ("with VWAP exit", True)):
+        p = {**base, "vwap_exit": vx}
+        res = {}
+        for sym, (days, series, sessions) in data.items():
+            trades = run(days, sym, series, sessions, p)
+            by_month, reasons = {}, {}
+            for x in trades:
+                if x["pnl"] is not None:
+                    by_month[x["date"][:7]] = round(by_month.get(x["date"][:7], 0) + x["pnl"], 2)
+                    r = reasons.setdefault(x["why"], [0, 0.0]); r[0] += 1; r[1] = round(r[1] + x["pnl"], 2)
+            res[sym] = {"summary": summary(trades), "by_month": by_month, "exits": reasons, "signal_days": len(trades),
+                        "trades": trades[-60:]}
+        grid = []
+        for band, trig, give, stop in itertools.product((0.2, 0.3, 0.4), (3.0, 4.0, 5.0), (0.4, 0.5, 0.6), (8.0, 10.0, 12.0)):
+            q = {**p, "band": band, "trigger": trig, "giveback": give, "stop": stop}
+            tot, n = 0.0, 0
+            for sym, (days, series, sessions) in data.items():
+                s_ = summary(run(days, sym, series, sessions, q)); tot += s_.get("total", 0); n += s_.get("trades", 0)
+            grid.append({"band": band, "trigger": trig, "giveback": give, "stop": stop, "total": round(tot, 2), "trades": n})
+        totals = np.array([g["total"] for g in grid])
+        out["variants"][name] = {"rules": p, "symbols": res, "grid": {
+            "combos": len(grid), "profitable_share": round(float((totals > 0).mean()), 3),
+            "median_total": round(float(np.median(totals)), 2), "best": max(grid, key=lambda g: g["total"]),
+            "worst": min(grid, key=lambda g: g["total"])}}
+        print(f"\n================ opening-range breakout · {name} ================")
+        for sym, r in res.items():
+            s_ = r["summary"]
+            if not s_.get("trades"):
+                print(f"{sym}: no trades with option data"); continue
+            months = r["by_month"]; green = sum(1 for v in months.values() if v > 0)
+            print(f"{sym}: {s_['trades']} trades · win {s_['win_rate']:.0%} · total ${s_['total']:+,.0f} · avg win ${s_['avg_win']:,.0f} / "
+                  f"loss ${s_['avg_loss']:,.0f} · profit factor {s_['profit_factor']} · worst drawdown ${s_['max_drawdown']:,.0f} · "
+                  f"months {green}/{len(months)} green · shares {s_['shares_total_pct']:+.1f}%")
+            print("      exits: " + " · ".join(f"{k} {v[0]} (${v[1]:+,.0f})" for k, v in r["exits"].items()))
+        g = out["variants"][name]["grid"]
+        print(f"robustness: {g['profitable_share']:.0%} of {g['combos']} nearby settings profitable · median ${g['median_total']:+,.0f} · "
+              f"best ${g['best']['total']:+,.0f} · worst ${g['worst']['total']:+,.0f}", flush=True)
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / "results.json").write_text(json.dumps(out, default=str))
     return 0
 
 
