@@ -97,6 +97,12 @@ def regular_session(df: pd.DataFrame) -> pd.DataFrame:
     return df[(mins >= 570) & (mins < 960)].reset_index(drop=True)
 
 
+def empty_bars() -> pd.DataFrame:
+    """No bars, but with proper column types, so it combines cleanly with real months."""
+    return pd.DataFrame({"ts": pd.Series([], dtype="datetime64[ns, America/New_York]"),
+                         **{c: pd.Series([], dtype=float) for c in ("open", "high", "low", "close", "volume")}})
+
+
 def download_month(symbol: str, y: int, m: int) -> pd.DataFrame:
     path = DATA_DIR / symbol / f"{y}-{m:02d}.csv.gz"
     current = (y, m) == (dt.date.today().year, dt.date.today().month)
@@ -112,8 +118,8 @@ def download_month(symbol: str, y: int, m: int) -> pd.DataFrame:
     end = min(end, dt.datetime.now(NY) - dt.timedelta(minutes=16))   # free plan: no last 15 min
     bars = client.get_stock_bars(StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute,
                                                   start=start, end=end, feed=DataFeed.IEX)).df
-    if bars.empty:
-        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+    if bars.empty:                                   # e.g. the first days of a month, before its first session
+        return empty_bars()
     bars = bars.reset_index()
     df = pd.DataFrame({"ts": pd.to_datetime(bars["timestamp"]).dt.tz_convert(NY),
                        "open": bars["open"], "high": bars["high"], "low": bars["low"],
