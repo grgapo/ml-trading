@@ -198,7 +198,8 @@ class ModelAgent:
             allowed = [1, 3] if direction > 0 else [2, 4]
             label = f"{', '.join(fired_signals(row))} {'▲' if direction > 0 else '▼'} · "
         if "garch_vol" in self.names:
-            row["garch_vol"], row["vol_ratio"] = self._vol_today(symbol, now, float(row["close"]))
+            for k, v in self._vol_today(symbol, now, float(row["close"])).items():
+                row[k] = v
         f = row[self.names].to_numpy(dtype=float)
         if np.isnan(f).any():
             return None
@@ -214,22 +215,23 @@ class ModelAgent:
                 "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in allowed}}
 
     def _vol_today(self, symbol, now, last_price):
-        """(garch_vol, vol_ratio) for today, computed once per symbol per day."""
+        """Today's day-level context for this symbol (volatility forecast, VIX, scheduled events),
+        computed once per symbol per day. Returns a dict of DAILY_COLS."""
         import pandas as pd
-        from features import daily_vol_table
+        from features import DAILY_COLS, daily_vol_table
         today = now.date()
         hit = self.vol_cache.get(symbol)
         if hit and hit[0] == today:
             return hit[1]
-        val = (float("nan"), float("nan"))
+        val = {c: float("nan") for c in DAILY_COLS}
         try:
             d = self.market.daily_bars(symbol)
             d = d[d["ts"].dt.date < today]
             d = pd.concat([d, pd.DataFrame({"ts": [pd.Timestamp(now)], "close": [last_price]})], ignore_index=True)
             tab = daily_vol_table(d)
-            val = (float(tab["garch_vol"].iloc[-1]), float(tab["vol_ratio"].iloc[-1]))
+            val = {c: float(tab[c].iloc[-1]) for c in DAILY_COLS}
         except Exception as exc:
-            print(f"vol forecast unavailable for {symbol}: {exc}")
+            print(f"daily context unavailable for {symbol}: {exc}")
         self.vol_cache[symbol] = (today, val)
         return val
 
@@ -255,7 +257,8 @@ class ModelAgent:
         if direction == 0 or key in self.seen or not (lo <= row["minutes_since_open"] <= hi):
             return None
         self.seen.add(key)
-        row["garch_vol"], row["vol_ratio"] = self._vol_today(symbol, now, float(row["close"]))
+        for k, v in self._vol_today(symbol, now, float(row["close"])).items():
+            row[k] = v
         from strategy import confluence_ok, vol_ok
         if not confluence_ok(direction, row.get("conf_bull", 1), row.get("conf_bear", 1), st.get("confluence")):
             return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: only "
@@ -264,6 +267,17 @@ class ModelAgent:
         if not vol_ok(row["vol_ratio"], st.get("vol_filter", "off")):
             return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: "
                     f"{st.get('vol_filter')} days only (vol ratio {row['vol_ratio']:.2f})",
+                    "features": None, "preds": None}
+        from strategy import event_ok, vix_ok
+        ev_today = float(((row.get("fomc_day", 0) or 0) + (row.get("cpi_day", 0) or 0) + (row.get("jobs_day", 0) or 0)) > 0)
+        if not event_ok(ev_today, st.get("event_filter", "off")):
+            return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: "
+                    f"{'no trading on event days' if st.get('event_filter') == 'skip' else 'event days only'}",
+                    "features": None, "preds": None}
+        if not vix_ok(row.get("vix_rel", float("nan")), st.get("vix_filter", "off")):
+            return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: "
+                    f"VIX {'below' if st.get('vix_filter') == 'low' else 'above'} usual only "
+                    f"(now {100 * (row.get('vix_rel') or 0):+.0f}% vs its 1-year median)",
                     "features": None, "preds": None}
         options = [a + 1 for a in allowed_actions(direction, st["dte"])]   # -> ACTIONS indices
         fired = [SIGNAL_NAMES[sg] for sg in st["signals"] if row[sg] != 0]
@@ -321,6 +335,13 @@ class ModelAgent:
             from options_search import qualify
             ok, _ = qualify({"X": X}, self.strategy)
             X, R = X[ok], R[ok]
+        # only real trades recorded with the same inputs as this model and its practice data
+        # (trades from before an input change can't be lined up with the new columns)
+        width = X.shape[1]
+        live = [r for r in live if len(json.loads(r["features"])) == width]
+        if not live or len(self.names) != width:
+            print("overnight replay skipped: model, practice data and real trades use different inputs (retrain to refresh)")
+            return
         LX = np.array([json.loads(r["features"]) for r in live])
         # A live trade only reveals the outcome of the action actually taken: use the
         # model's current prediction for the other actions so they are left unchanged.

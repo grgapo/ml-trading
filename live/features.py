@@ -20,8 +20,12 @@ FEATURES = [
     "conf_bull", "conf_bear",
     # daily volatility regime (GARCH forecast for today vs recent realized volatility)
     "garch_vol", "vol_ratio",
+    # market context, all known before the open: yesterday's VIX (level, 5-day change, vs its
+    # 1-year median) and today's scheduled events (Fed decision, CPI, jobs report)
+    "vix_level", "vix_chg5", "vix_rel", "fomc_day", "cpi_day", "jobs_day",
 ]
-FEATURE_VERSION = 4   # bump when inputs or pricing change, so cached practice data is rebuilt (4: real option prices)
+FEATURE_VERSION = 5   # bump when inputs or pricing change, so cached practice data is rebuilt (5: market context)
+DAILY_COLS = ["garch_vol", "vol_ratio", "vix_level", "vix_chg5", "vix_rel", "fomc_day", "cpi_day", "jobs_day", "event_day"]
 CONFLUENCE_BARS = 15
 SIGNALS = ["sig_vwap", "sig_ema50", "sig_orb", "sig_fvg"]
 SIGNAL_NAMES = {"sig_vwap": "VWAP cross", "sig_ema50": "50 EMA cross",
@@ -216,12 +220,57 @@ def daily_vol_table(bars: pd.DataFrame, refit_every: int = 21) -> pd.DataFrame:
     except ImportError:
         pass
     out["vol_ratio"] = out["garch_vol"] / out["rv20"]
-    return out[["garch_vol", "vol_ratio"]]
+    # market context (known before each day's open)
+    vix = vix_daily()
+    if vix is not None and len(vix):
+        v = vix.reindex(pd.to_datetime(list(out.index))).ffill()
+        v.index = out.index
+        prev = v.shift(1)                                         # yesterday's close: known at today's open
+        out["vix_level"] = prev / 20.0
+        out["vix_chg5"] = prev / v.shift(6) - 1
+        med = vix.rolling(252, min_periods=60).median().reindex(pd.to_datetime(list(out.index))).ffill()
+        med.index = out.index
+        out["vix_rel"] = prev / med.shift(1) - 1
+    else:
+        out["vix_level"] = out["vix_chg5"] = out["vix_rel"] = np.nan     # the models handle missing values
+    import market_events
+    ev = pd.DataFrame([market_events.flags(d) for d in out.index], index=out.index)
+    out = out.join(ev)
+    return out[DAILY_COLS]
+
+
+_VIX: dict = {}
+
+
+def vix_daily(refresh_hours: float = 12) -> pd.Series | None:
+    """VIX daily closes (Yahoo '^VIX'), cached under data/context/vix.csv. None if unavailable."""
+    import os
+    import time
+    from pathlib import Path
+    if "s" in _VIX:
+        return _VIX["s"]
+    path = Path(os.environ.get("BARS_DIR", Path.home() / "projects" / "data" / "bars")).parent / "context" / "vix.csv"
+    s = None
+    try:
+        if path.exists() and time.time() - path.stat().st_mtime < refresh_hours * 3600:
+            s = pd.read_csv(path, index_col=0, parse_dates=True).iloc[:, 0]
+        else:
+            import yfinance as yf
+            d = yf.download("^VIX", start="2015-01-01", auto_adjust=False, progress=False)["Close"]
+            s = (d.iloc[:, 0] if hasattr(d, "columns") else d).dropna()
+            s.index = pd.to_datetime(s.index).tz_localize(None)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            s.to_frame("vix").to_csv(path)
+    except Exception:
+        if path.exists():
+            s = pd.read_csv(path, index_col=0, parse_dates=True).iloc[:, 0]
+    _VIX["s"] = s
+    return s
 
 
 def attach_daily_vol(df: pd.DataFrame, table: pd.DataFrame) -> pd.DataFrame:
-    """Add each bar's day-level volatility forecast (same value for the whole day)."""
-    for col in ("garch_vol", "vol_ratio"):
+    """Add each bar's day-level context: volatility forecast, VIX, scheduled events (same all day)."""
+    for col in table.columns:
         df[col] = df["date"].map(table[col]).astype(float)
     return df
 

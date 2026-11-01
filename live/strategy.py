@@ -23,6 +23,10 @@ SPACE = {
     "confidence": ["off", 0.7, 0.8],
     # how many different setups must agree (within ~15 bars) before a trade is allowed
     "confluence": [1, 2, 3],
+    # scheduled events (Fed decision, CPI, jobs report): trade any day, skip those days, or only those days
+    "event_filter": ["off", "skip", "only"],
+    # VIX vs its 1-year median: any, calmer than usual, or more nervous than usual
+    "vix_filter": ["off", "low", "high"],
 }
 VOL_SPLIT = 1.0   # vol_ratio above this = volatility expected to rise ("volatile")
 SIGNAL_SETS = [list(c) for n in range(1, len(SIGNALS) + 1) for c in itertools.combinations(SIGNALS, n)]
@@ -47,9 +51,12 @@ def describe(p: dict) -> str:
     vol = p.get("vol_filter", "off")
     if (p.get("confluence") or 1) > 1:
         pick += f" · {p['confluence']}+ agree"
+    ev, vx = p.get("event_filter", "off"), p.get("vix_filter", "off")
     return (f"{p['bar_minutes']}m · {sigs} · SL{p['stop_loss']:.0%} TP+{p['take_profit']:.0%} · "
             f"{p['max_hold']}min · {p['dte'].upper()} · {p['window']} · {pick}"
-            + (f" · {vol} days" if vol not in (None, "off") else ""))
+            + (f" · {vol} days" if vol not in (None, "off") else "")
+            + ({"skip": " · skip event days", "only": " · event days only"}.get(ev, ""))
+            + ({"low": " · VIX below usual", "high": " · VIX above usual"}.get(vx, "")))
 
 
 def dataset_key(p: dict) -> str:
@@ -59,6 +66,18 @@ def dataset_key(p: dict) -> str:
 def confluence_ok(direction: int, conf_bull: float, conf_bear: float, need) -> bool:
     need = need or 1
     return (conf_bull if direction > 0 else conf_bear) >= need
+
+
+def event_ok(event_day: float, setting: str | None) -> bool:
+    if setting in (None, "off") or event_day != event_day:
+        return True
+    return (event_day == 0) if setting == "skip" else (event_day == 1)
+
+
+def vix_ok(vix_rel: float, setting: str | None) -> bool:
+    if setting in (None, "off") or vix_rel != vix_rel:     # NaN: no VIX data -> don't filter
+        return True
+    return vix_rel <= 0 if setting == "low" else vix_rel > 0
 
 
 def vol_ok(vol_ratio: float, setting: str | None) -> bool:

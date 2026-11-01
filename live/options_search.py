@@ -119,6 +119,15 @@ def qualify(data: dict, p: dict) -> tuple[np.ndarray, np.ndarray]:
     if vf not in (None, "off"):
         vr = X[:, COL["vol_ratio"]]
         ok &= (vr <= VOL_SPLIT) if vf == "calm" else (vr > VOL_SPLIT)
+    ef = p.get("event_filter", "off")
+    if ef not in (None, "off") and "fomc_day" in COL:
+        ev = (X[:, COL["fomc_day"]] + X[:, COL["cpi_day"]] + X[:, COL["jobs_day"]]) > 0
+        ok &= ~ev if ef == "skip" else ev
+    xf = p.get("vix_filter", "off")
+    if xf not in (None, "off") and "vix_rel" in COL:
+        vx = X[:, COL["vix_rel"]]
+        known = ~np.isnan(vx)
+        ok &= ~known | ((vx <= 0) if xf == "low" else (vx > 0))
     return ok, direction
 
 
