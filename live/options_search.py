@@ -183,9 +183,10 @@ def fit_with_confidence(X: np.ndarray, R: np.ndarray, confidence) -> tuple[list,
 RECENT_TRADES: list = []        # sample of simulated trades for the app's live stream
 
 
-def run_folds(data: dict, p: dict, folds: list[tuple[np.ndarray, np.ndarray]]) -> dict:
+def run_folds(data: dict, p: dict, folds: list[tuple[np.ndarray, np.ndarray]], keep_trades: bool = False) -> dict:
     ok, direction = qualify(data, p)
     tot = {"pnl": 0.0, "days": 0, "green_days": 0, "trades": 0, "wins": 0}
+    per_trade: list[float] = []
     by_month: dict = {}
     names = ["call 1DTE", "put 1DTE", "call 0DTE", "put 0DTE"]
     simulated = 0
@@ -219,6 +220,7 @@ def run_folds(data: dict, p: dict, folds: list[tuple[np.ndarray, np.ndarray]]) -
         for k in tot:
             tot[k] += res[k]
         for r, a, dollars, ret in res["taken"]:
+            per_trade.append(float(dollars))
             t = pd.Timestamp(data["ts"][r], tz="UTC").tz_convert(NY)
             by_month[t.strftime("%Y-%m")] = by_month.get(t.strftime("%Y-%m"), 0.0) + dollars
             RECENT_TRADES.append({"t": t.isoformat(timespec="minutes"), "sym": str(data["sym"][r]),
@@ -226,7 +228,29 @@ def run_folds(data: dict, p: dict, folds: list[tuple[np.ndarray, np.ndarray]]) -
     del RECENT_TRADES[:-400]
     tot["months"] = [[m, round(v, 2)] for m, v in sorted(by_month.items())]
     tot["simulated"] = simulated
+    if keep_trades and len(per_trade) > 1:
+        x = np.array(per_trade)
+        tot["mean"] = round(float(x.mean()), 2)
+        tot["se"] = round(float(x.std(ddof=1) / np.sqrt(len(x))), 2)
+        tot["t"] = round(float(x.mean() / max(x.std(ddof=1) / np.sqrt(len(x)), 1e-9)), 2)
     return tot
+
+
+# The promotion bar: a locked-test result has to be clearly positive, not just above zero.
+MIN_HOLDOUT_TRADES = int(os.environ.get("OPT_MIN_HOLDOUT_TRADES", "40"))
+MIN_EDGE_PER_TRADE = float(os.environ.get("OPT_MIN_EDGE_PER_TRADE", "10"))     # dollars per trade
+MIN_T = float(os.environ.get("OPT_MIN_T", "2.0"))                               # profit > 2x its noise
+
+
+def convincing(h: dict) -> tuple[bool, str]:
+    n, mean, t = h.get("trades", 0), h.get("mean"), h.get("t")
+    if n < MIN_HOLDOUT_TRADES:
+        return False, f"only {n} trades (needs {MIN_HOLDOUT_TRADES}+)"
+    if mean is None or mean < MIN_EDGE_PER_TRADE:
+        return False, f"avg {mean if mean is not None else 0:+.2f}/trade (needs +{MIN_EDGE_PER_TRADE:.0f}+)"
+    if t is None or t < MIN_T:
+        return False, f"profit is {t if t is not None else 0:.1f}x its noise (needs {MIN_T:.1f}x+)"
+    return True, f"avg {mean:+.2f}/trade over {n} trades, {t:.1f}x its noise"
 
 
 def periods(data: dict):
@@ -272,6 +296,34 @@ def sample(rng: random.Random) -> dict:
 
 def key_of(p: dict) -> str:
     return json.dumps(p, sort_keys=True)
+
+
+# Robustness: a real edge survives small changes to its settings; a fluke collapses.
+ROBUST_TOP = int(os.environ.get("OPT_ROBUST_TOP", "20"))           # candidates checked each night
+ROBUST_MAX_NEIGHBORS = int(os.environ.get("OPT_ROBUST_NEIGHBORS", "12"))
+ROBUST_MIN_SHARE = float(os.environ.get("OPT_ROBUST_MIN_SHARE", "0.6"))   # of neighbors that must be profitable
+ROBUST_RESERVE_MIN = int(os.environ.get("OPT_ROBUST_RESERVE_MIN", "75"))  # minutes kept for this before the deadline
+NEIGHBOR_KEYS = ["bar_minutes", "stop_loss", "take_profit", "max_hold", "dte", "window", "min_edge", "vol_filter",
+                 "confidence", "confluence", "event_filter", "vix_filter", "moneyness", "day_filter"]
+
+
+def neighbors(p: dict, rng: random.Random) -> list[dict]:
+    """Variations one step away on a single setting (the next value up or down in its list)."""
+    out = []
+    for k in NEIGHBOR_KEYS:
+        vals = SPACE.get(k)
+        if not vals or p.get(k) is None or p.get(k) not in vals:
+            continue                                     # e.g. quick-exit settings under ATR exits
+        if k == "min_edge" and not p.get("use_model"):
+            continue
+        if k == "confidence" and not p.get("use_model"):
+            continue
+        i = vals.index(p[k])
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(vals):
+                out.append({**p, k: vals[j]})
+    rng.shuffle(out)
+    return out[:ROBUST_MAX_NEIGHBORS]
 
 
 def summarize(entry: dict) -> dict:
@@ -381,6 +433,7 @@ def promote(entry: dict, raw: dict, memo: dict, champion: dict) -> None:
     joblib.dump(bundle, MODEL_PATH)
     champion.update(params=p, desc=entry["desc"], search_pnl=entry["search"]["pnl"],
                     holdout_pnl=entry["holdout"]["pnl"], holdout_trades=entry["holdout"]["trades"],
+                    holdout_mean=entry["holdout"].get("mean"), holdout_t=entry["holdout"].get("t"),
                     promoted=bundle["created"], live=None, regrade=[])
     save_json(CHAMPION, champion)
     notify(f"New champion promoted to the options bot: {entry['desc']} "
@@ -390,7 +443,7 @@ def promote(entry: dict, raw: dict, memo: dict, champion: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Nightly options strategy search")
     ap.add_argument("--until", help="stop at this New York time, HH:MM (next occurrence)")
-    ap.add_argument("--trials", type=int, default=10_000)
+    ap.add_argument("--trials", type=int, default=1_000_000)   # in practice: until the deadline
     ap.add_argument("--months", type=int, default=24)
     ap.add_argument("--symbols", default=os.environ.get("OPT_SYMBOLS", "SPY,QQQ"))
     ap.add_argument("--synthetic", action="store_true")
@@ -441,7 +494,8 @@ def main() -> int:
             print(f"simulator check skipped: {exc}")
         status("checking the live champion")
         monitor_champion(champion, raw, memo)
-        while tonight < args.trials and (deadline is None or dt.datetime.now(NY) < deadline - dt.timedelta(minutes=20)):
+        explore_until = deadline - dt.timedelta(minutes=20 + ROBUST_RESERVE_MIN) if deadline else None
+        while tonight < args.trials and (explore_until is None or dt.datetime.now(NY) < explore_until):
             p = sample(rng)
             k = key_of(p)
             if k in tried:
@@ -458,21 +512,54 @@ def main() -> int:
                       {"variation": describe(p), "trades": RECENT_TRADES[-300:]})
             tonight += 1
 
-        # One holdout look per night: best untested candidate that clears the bar.
+        # Robustness pass: re-test the top candidates' close neighbours (one setting nudged at a time).
+        pool = sorted((e for e in board if "holdout" not in e and e["search"]["trades"] >= MIN_TRADES
+                       and e["search"]["pnl"] > max(0.0, champion.get("search_pnl") or 0.0)),
+                      key=lambda e: e["search"]["pnl"], reverse=True)[:ROBUST_TOP]
+        by_key = {key_of(e["params"]): e for e in board}
+        for n_c, cand in enumerate(pool, 1):
+            if deadline is not None and dt.datetime.now(NY) >= deadline - dt.timedelta(minutes=20):
+                break
+            if "robust" in cand:
+                continue
+            status("robustness check", f"{n_c}/{len(pool)} · {cand['desc']}")
+            results = []
+            for q in neighbors(cand["params"], rng):
+                k = key_of(q)
+                if k in by_key:                          # already tested: reuse
+                    results.append(by_key[k]["search"]["pnl"]); continue
+                data = dataset_for(q, raw, memo)
+                folds, (f0, f1) = search_folds(data)
+                res = run_folds(data, q, folds)
+                e = {"params": q, "desc": describe(q), "search": res, "search_period": [f0, f1],
+                     "tested": dt.datetime.now(NY).isoformat(timespec="seconds"), "neighbor_of": cand["desc"]}
+                board.append(e); by_key[k] = e; tried.add(k); tonight += 1
+                results.append(res["pnl"])
+            if results:
+                arr = np.array(results)
+                cand["robust"] = {"neighbors": len(arr), "profitable_share": round(float((arr > 0).mean()), 3),
+                                  "median_pnl": round(float(np.median(arr)), 2), "worst_pnl": round(float(arr.min()), 2)}
+            save_json(LEADERBOARD, board)
+
+        # One holdout look per night: the best candidate whose neighbours are mostly profitable too
+        # (ranked by the median neighbour, a conservative read of its edge).
         status("checking the best candidate on the locked holdout")
-        candidates = sorted((e for e in board if "holdout" not in e and e["search"]["trades"] >= MIN_TRADES
-                             and e["search"]["pnl"] > max(0.0, champion.get("search_pnl") or 0.0)),
-                            key=lambda e: e["search"]["pnl"], reverse=True)
+        candidates = sorted((e for e in pool if e.get("robust", {}).get("profitable_share", 0) >= ROBUST_MIN_SHARE
+                             and e["robust"]["median_pnl"] > 0),
+                            key=lambda e: e["robust"]["median_pnl"], reverse=True)
         if candidates:
             best = candidates[0]
             data = dataset_for(best["params"], raw, memo)
             folds, (h0, h1) = holdout_fold(data)
-            best["holdout"] = run_folds(data, best["params"], folds)
+            best["holdout"] = run_folds(data, best["params"], folds, keep_trades=True)
             best["holdout_period"] = [h0, h1]
             champion["holdout_checks"] = champion.get("holdout_checks", 0) + 1
+            ok_bar, why = convincing(best["holdout"])
+            best["holdout"]["verdict"] = ("passed: " if ok_bar else "not convincing: ") + why
             save_json(LEADERBOARD, board)
-            if best["holdout"]["pnl"] > max(0.0, champion.get("holdout_pnl") or 0.0) and \
-                    best["holdout"]["trades"] >= MIN_TRADES // 3:
+            # a champion promoted under the old, looser bar doesn't block a convincing newcomer
+            to_beat = (champion.get("holdout_pnl") or 0.0) if champion.get("holdout_t") is not None else 0.0
+            if ok_bar and best["holdout"]["pnl"] > max(0.0, to_beat):
                 missing = needs_live_support(best["params"])
                 if missing:                                 # passed, but the live bot can't run it yet
                     champion["pending"] = {"desc": best["desc"], "params": best["params"], "holdout_pnl": best["holdout"]["pnl"],
