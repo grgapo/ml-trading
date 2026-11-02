@@ -284,7 +284,7 @@ def main() -> int:
     hold_search = hold_return(ind, start, SPLIT); hold_lock = hold_return(ind, SPLIT, None)
     STATUS.update(search_period=[str(start.date()), "2024-12-31"], holdout_period=["2025-01-01", str(ind["date"].iloc[-1].date())],
                   hold_search=round(hold_search, 4), hold_holdout=round(hold_lock, 4))
-    rng = random.Random(); recent = []
+    rng = random.Random(); recent = []; last_save = time.time(); d = ""
     rt_path = STATE_DIR / "search" / "recent_trades.json"
     for k in range(args.trials):
         p = random_variation(rng); d = describe(p)
@@ -298,8 +298,12 @@ def main() -> int:
         STATUS["profitable"] += res["pnl"] > 0; STATUS["sim_trades_taken"] += res["trades"]; STATUS["sim_wins"] += res["wins"]
         STATUS["simulated_total"] += res["simulated"]
         recent = (recent + trades[-40:])[-300:]
-        write(rt_path, {"variation": d, "trades": recent})
-        write(board_path, board[-1500:])
+        if time.time() - last_save >= 60:                 # save once a minute, not every variation (SSD wear)
+            write(rt_path, {"variation": d, "trades": recent})
+            write(board_path, board[-1500:])
+            last_save = time.time()
+    write(rt_path, {"variation": d if args.trials else "", "trades": recent})
+    write(board_path, board[-1500:])
     # one look at the locked period for the best untested candidate
     status(phase="checking the best candidate on the locked period", current=None)
     looked = set(champ.get("looked", []))
@@ -308,7 +312,9 @@ def main() -> int:
         best = cands[0]
         hold_res, _ = grade(ind, best["params"], SPLIT, None)
         looked.add(best["desc"])
-        promoted = hold_res["pnl"] > 0 and hold_res["pnl"] > (champ.get("holdout_pnl") or 0)
+        # the bar: make money on the locked period AND beat simply holding the coins there
+        promoted = (hold_res["pnl"] > 0 and hold_res["pnl"] > hold_lock * WALLET
+                    and hold_res["pnl"] > (champ.get("holdout_pnl") or 0))
         entry = {"desc": best["desc"], "params": best["params"], "holdout_pnl": hold_res["pnl"], "holdout_trades": hold_res["trades"],
                  "holdout_months": hold_res["months"], "hold_holdout_pct": round(hold_lock, 4),
                  "checked": dt.datetime.now(NY).isoformat(timespec="seconds")}

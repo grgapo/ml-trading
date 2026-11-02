@@ -495,6 +495,7 @@ def main() -> int:
         status("checking the live champion")
         monitor_champion(champion, raw, memo)
         explore_until = deadline - dt.timedelta(minutes=20 + ROBUST_RESERVE_MIN) if deadline else None
+        last_save = time.time()                         # results file is big: save once a minute, not every variation
         while tonight < args.trials and (explore_until is None or dt.datetime.now(NY) < explore_until):
             p = sample(rng)
             k = key_of(p)
@@ -507,10 +508,13 @@ def main() -> int:
             res = run_folds(data, p, folds)
             board.append({"params": p, "desc": describe(p), "search": res, "search_period": [f0, f1],
                           "tested": dt.datetime.now(NY).isoformat(timespec="seconds")})
-            save_json(LEADERBOARD, board)
-            save_json(SEARCH_DIR / "recent_trades.json",
-                      {"variation": describe(p), "trades": RECENT_TRADES[-300:]})
             tonight += 1
+            if time.time() - last_save >= 60:
+                save_json(LEADERBOARD, board)
+                save_json(SEARCH_DIR / "recent_trades.json", {"variation": describe(p), "trades": RECENT_TRADES[-300:]})
+                last_save = time.time()
+        save_json(LEADERBOARD, board)                       # everything explored tonight, before the robustness pass
+        save_json(SEARCH_DIR / "recent_trades.json", {"variation": board[-1]["desc"] if board else "", "trades": RECENT_TRADES[-300:]})
 
         # Robustness pass: re-test the top candidates' close neighbours (one setting nudged at a time).
         pool = sorted((e for e in board if "holdout" not in e and e["search"]["trades"] >= MIN_TRADES
