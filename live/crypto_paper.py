@@ -90,7 +90,8 @@ def main() -> int:
         out.append({**e, "stats": {"trades": len(sells), "total": round(run, 2), "pct": round(run / C.WALLET, 4), "curve": curve,
                                    "win_rate": round(len(wins) / len(sells), 3) if sells else None,
                                    "profit_factor": round(sum(wins) / -sum(losses), 2) if losses and sum(losses) < 0 else None},
-                    "today": {"exposure": exposure}, "recent_trades": trades[-10:]})
+                    "today": {"exposure": {k: v["pct"] for k, v in exposure.items()}, "holdings": exposure},
+                    "recent_trades": trades[-15:]})
     hold = next((x for x in out if x["id"] == "crypto-hold"), None)
     for x in out:
         if hold and x["id"] != "crypto-hold":

@@ -193,16 +193,22 @@ def simulate_regime(ind: dict, p: dict, start: pd.Timestamp, end: pd.Timestamp |
             monthly[months[i]] = monthly.get(months[i], 0.0) + (value - value_prev)
             daily[days[i]] = daily.get(days[i], 0.0) + (value - value_prev)
             value_prev = value
-        exposure[pair.split("/")[0]] = round(units * c[hi - 1] / max(cash + units * c[hi - 1], 1e-9), 3) if hi > lo else 0.0
-    sells = [t for t in trades if t["kind"] == "sell"]
-    return monthly, sells or trades, daily, exposure
+        coin = pair.split("/")[0]
+        if hi > lo:
+            px = float(c[hi - 1]); val = units * px
+            exposure[coin] = {"pct": round(val / max(cash + val, 1e-9), 3), "units": round(units, 6), "price": round(px, 2),
+                              "value": round(val, 2), "avg_cost": round(avg, 2), "cash": round(cash, 2),
+                              "unrealized": round(units * (px - avg), 2) if units else 0.0}
+    trades.sort(key=lambda t: t["t"])
+    return monthly, trades, daily, exposure
 
 
 def simulate(ind: dict, p: dict, start: pd.Timestamp, end: pd.Timestamp | None):
     """Run one variation between start and end. Returns (monthly $ P&L dict, trades list, equity end)."""
     if p["strategy"] == "LabRegime":
         monthly, trades, _daily, _exp = simulate_regime(ind, p, start, end)
-        return monthly, trades
+        sells = [t for t in trades if t["kind"] == "sell"]          # graded on completed (sell) trades
+        return monthly, sells or trades
     dates = ind["date"]
     lo = int(np.searchsorted(ind["ns"], start.value))
     hi = len(dates) if end is None else int(np.searchsorted(ind["ns"], end.value))
