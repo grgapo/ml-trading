@@ -89,6 +89,12 @@ def main() -> int:
             book["cash"] -= amt
         if not args.dry_run:
             book["last_rebalance"] = today; book["champion"] = champ["desc"]
+            # report what the account holds AFTER the orders, not before (give market orders a moment to fill)
+            import time
+            time.sleep(45)
+            held = {p.symbol: p for p in tc.get_all_positions() if "option" not in str(p.asset_class).lower()}
+            value_pos = sum(float(p.market_value) for p in held.values())
+            sleeve = value_pos + book["cash"]
     spy = float(px["SPY"].dropna().iloc[-1]); ief = float(px["IEF"].dropna().iloc[-1])
     if not book["history"] or book["history"][-1][0] != today:
         book["history"].append([today, round(sleeve, 2), spy, ief])

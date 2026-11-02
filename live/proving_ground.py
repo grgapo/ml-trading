@@ -82,6 +82,37 @@ def registry() -> list[dict]:
     return reg
 
 
+def open_file() -> Path:
+    return STATE / "open_positions.json"
+
+
+def remember_open(contract: str, exp_id: str, sym: str, log: bool = True) -> None:
+    f = open_file(); d = json.loads(f.read_text()) if f.exists() else {}
+    d[contract] = {"experiment": exp_id, "symbol": sym, "since": dt.datetime.now(NY).isoformat(timespec="seconds"), "log": log}
+    save(f, d)
+
+
+def forget_open(contract: str) -> None:
+    f = open_file(); d = json.loads(f.read_text()) if f.exists() else {}
+    if d.pop(contract, None) is not None:
+        save(f, d)
+
+
+def close_leftovers(market, log: list[str], when: str) -> None:
+    """Anything the proving ground still holds that it shouldn't (carried over from an earlier day, or not
+    closed by 3:45): close it and tell Greg."""
+    f = open_file(); d = json.loads(f.read_text()) if f.exists() else {}
+    for contract, info in list(d.items()):
+        h = market.held(contract) if hasattr(market, "held") else None
+        if not h:
+            forget_open(contract); continue
+        px = market.sell(contract, int(h[0]))
+        if px is not None:
+            forget_open(contract)
+            msg = f"closed leftover {contract} ({int(h[0])}x, bought at ${h[1]:.2f}) at ${px:.2f} {when}"
+            log.append(f"{market.now():%H:%M} {msg}"); notify(f"Proving ground {msg}")
+
+
 def read_trades() -> list[dict]:
     return list(csv.DictReader(TRADES.open())) if TRADES.exists() else []
 
@@ -143,22 +174,48 @@ class LiveMarket:
             return None
         return float(q.ask_price if side == "buy" else q.bid_price) or None
 
-    def buy(self, contract: str, qty: int) -> float | None:
-        return self._order(contract, qty, "buy")
+    def held(self, contract: str):
+        try:
+            p = self.trading.get_open_position(contract)
+            return float(p.qty), float(p.avg_entry_price)
+        except Exception:
+            return None
 
-    def sell(self, contract: str, qty: int) -> float | None:
-        return self._order(contract, qty, "sell")
+    def _cancel_open(self, contract: str) -> None:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        for o in self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[contract])):
+            self.trading.cancel_order_by_id(o.id)
 
-    def _order(self, contract, qty, side):
+    def buy(self, contract: str, qty: int):
+        """Market buy; returns (fill price, qty) confirmed by the actual position at Alpaca, or None."""
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
-        o = self.trading.submit_order(MarketOrderRequest(symbol=contract, qty=qty, time_in_force=TimeInForce.DAY,
-                                                         side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-                                                         client_order_id=f"pg-{contract}-{side}-{int(time.time())}"))
-        for _ in range(30):
-            o = self.trading.get_order_by_id(o.id)
-            if str(o.status).endswith("filled") and o.filled_avg_price:
-                return float(o.filled_avg_price)
+        self.trading.submit_order(MarketOrderRequest(symbol=contract, qty=qty, side=OrderSide.BUY,
+                                                     time_in_force=TimeInForce.DAY,
+                                                     client_order_id=f"pg-{contract}-buy-{int(time.time())}"))
+        for _ in range(60):
+            h = self.held(contract)
+            if h and h[0] > 0:
+                return h[1], int(h[0])
+            time.sleep(1)
+        self._cancel_open(contract)
+        time.sleep(2)
+        h = self.held(contract)                         # filled while we were cancelling?
+        return (h[1], int(h[0])) if h and h[0] > 0 else None
+
+    def sell(self, contract: str, qty: int):
+        """Close the position; returns the exit price once the position is confirmed gone, or None."""
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        if not self.held(contract):
+            return None
+        self.trading.close_position(contract)
+        for _ in range(60):
+            if not self.held(contract):
+                orders = self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[contract], limit=5))
+                fills = [float(o.filled_avg_price) for o in orders if o.filled_avg_price and getattr(o.side, "value", str(o.side)).lower() == "sell"]
+                return fills[0] if fills else self.option_price(contract, "sell")
             time.sleep(1)
         return None
 
@@ -204,8 +261,12 @@ class ReplayMarket:
         p = self._opt(contract)
         return None if p is None or not np.isfinite(p) else float(p * (1 + ORB.SPREAD / 2 if side == "buy" else 1 - ORB.SPREAD / 2))
 
+    def held(self, contract):
+        return None
+
     def buy(self, contract, qty):
-        return self.option_price(contract, "buy")
+        px = self.option_price(contract, "buy")
+        return (px, qty) if px else None
 
     def sell(self, contract, qty):
         return self.option_price(contract, "sell")
@@ -303,9 +364,11 @@ class OrbCalm:
                     if not ask or ask < 0.10:
                         st["phase"] = "done for today"; st["note"] = f"no price for {contract}"; continue
                     qty = int(self.exp["stake"] // (ask * 100))
-                    fill = self.mk.buy(contract, qty) if qty > 0 else None
-                    if not fill:
-                        st["phase"] = "done for today"; st["note"] = "buy didn't fill"; continue
+                    got = self.mk.buy(contract, qty) if qty > 0 else None
+                    if not got:
+                        st["phase"] = "done for today"; st["note"] = "buy didn't fill (no position at the broker)"; continue
+                    fill, qty = got
+                    remember_open(contract, self.ID, sym)
                     st.update(phase="in a trade", side=side, contract=contract, qty=qty, entry=fill, atr=atr,
                               entry_u=float(d["c"][min(minute, d["seen"]) - 1]), entry_min=minute, best=0.0,
                               opened=self.mk.now().isoformat(timespec="seconds"), path=[])
@@ -323,7 +386,11 @@ class OrbCalm:
                 elif minute >= ORB.FLAT:
                     why = "3:45 exit"
                 if why:
-                    px = self.mk.sell(st["contract"], st["qty"]) or self.mk.option_price(st["contract"], "sell") or 0.0
+                    px = self.mk.sell(st["contract"], st["qty"])
+                    if px is None and self.mk.held(st["contract"]):
+                        st["note"] = "sell not confirmed yet, retrying next minute"; continue
+                    px = px or self.mk.option_price(st["contract"], "sell") or 0.0
+                    forget_open(st["contract"])
                     pnl = round(st["qty"] * 100 * (px - st["entry"]), 2)
                     log_trade({"date": str(self.mk.today), "experiment": self.ID, "symbol": sym, "side": st["side"],
                                "contract": st["contract"], "qty": st["qty"], "entry_time": st["opened"],
@@ -395,11 +462,17 @@ def write_status(reg, runners, phase, log, market):
 
 def main() -> int:
     ap = argparse.ArgumentParser(); ap.add_argument("--replay", help="YYYY-MM-DD: replay a past day on stored prices")
+    ap.add_argument("--record", action="store_true",
+                    help="with --replay: write the replayed trades into the REAL record (to rebuild a mishandled day)")
     args = ap.parse_args()
     market = ReplayMarket(dt.date.fromisoformat(args.replay)) if args.replay else LiveMarket()
     global STATE, TRADES, REGISTRY
-    if args.replay:                                           # replays never touch the real records
+    if args.replay and not args.record:                       # replays never touch the real records (unless --record)
         STATE = STATE / "replay"; TRADES = STATE / "trades.csv"; REGISTRY = STATE / "experiments.json"
+    if args.replay and args.record:
+        already = [t for t in read_trades() if t["date"] == args.replay]
+        if already:
+            print(f"{args.replay} is already in the record ({len(already)} trades); nothing to do"); return 0
     reg = registry()
     log: list[str] = []
     if not market.is_open_day():
@@ -414,6 +487,7 @@ def main() -> int:
     if not args.replay:                                       # wait for the open
         while market.now().time() < dt.time(9, 31):
             write_status(reg, runners, "waiting for the open", log, market); time.sleep(20)
+        close_leftovers(market, log, "at the open (held overnight)")
     else:
         market.minute = 1
     while True:
@@ -429,6 +503,8 @@ def main() -> int:
         busy = any(st.get("phase") == "in a trade" for r in runners.values() for st in r.state.values())
         write_status(reg, runners, "in a trade" if busy else "watching", log, market)
         market.wait_next_minute()
+    if not args.replay:
+        close_leftovers(market, log, "after the session (should have closed by 3:45)")
     lifecycle(reg, read_trades())
     write_status(reg, runners, "session over", log, market)
     print(f"{market.today}: session over · " + " · ".join(f"{e['name']}: {e['status']}" for e in reg), flush=True)
