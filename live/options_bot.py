@@ -486,8 +486,9 @@ class AlpacaMarket:
     def buy(self, contract: str, qty: int) -> None:
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
-        self.trading.submit_order(MarketOrderRequest(
-            symbol=contract, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+        self.trading.submit_order(MarketOrderRequest(                       # tag = this bot, so the risk guard
+            symbol=contract, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,   # knows who owns it
+            client_order_id=f"{BOT_ID}-{contract}-buy-{int(time.time() * 1000)}"))
 
     def position(self, contract: str) -> dict | None:
         try:
@@ -497,8 +498,11 @@ class AlpacaMarket:
         return {"qty": float(p.qty), "entry": float(p.avg_entry_price),
                 "plpc": float(p.unrealized_plpc or 0.0), "pl": float(p.unrealized_pl or 0.0)}
 
-    def close(self, contract: str) -> None:
-        self.trading.close_position(contract)
+    def close(self, contract: str) -> bool:
+        """Sell everything and confirm by position (retries inside broker.sell). False = still held."""
+        br = BR.Broker(self.trading, confirm_s=20)
+        br.sell(contract)
+        return br.held(contract) is None
 
     def cancel_orders(self, contract: str) -> None:
         from alpaca.trading.enums import QueryOrderStatus
@@ -645,6 +649,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
 
     agent.market = market
     agent_stats = agent.stats()
+    live = not getattr(market, "simulated", False)
+    errors = 0                                           # consecutive loop errors (self-healing)
 
     def status(phase):
         open_t = {k: v for k, v in (day["open"] or {}).items() if k != "features"} or None
@@ -659,112 +665,149 @@ def run_session(market, agent: Agent, explore: float) -> dict:
         market.sleep(min(60, max(1, (open_t - market.now()).total_seconds())))
 
     while market.now() < close_t:
-        now = market.now()
-        t = day["open"]
-        if t:                                            # manage the open trade
-            pos = market.position(t["contract"])
-            if pos is None and (now - dt.datetime.fromisoformat(t["opened"])).total_seconds() < 120:
-                status("waiting for fill")
-            elif pos is None:                            # never filled: give up on it
-                market.cancel_orders(t["contract"])
-                day["open"] = None
-                status("order did not fill, cancelled")
-            else:
-                held = (now - dt.datetime.fromisoformat(t["opened"])).total_seconds() / 60
-                t.update(plpc=round(pos["plpc"], 4), pl_usd=round(pos["pl"], 2), entry=pos["entry"])
-                t.setdefault("path", []).append([now.strftime("%H:%M"), round(pos["plpc"], 4)])   # for the app's mini-chart
-                del t["path"][:-240]
-                try:                                     # underlying's 1-min candles since entry, for the app's monitor
-                    b = market.bars(t["symbol"])
-                    since = dt.datetime.fromisoformat(t["opened"]) - dt.timedelta(minutes=3)
-                    b = b[b["ts"] >= since]
-                    t["candles"] = [[r.ts.strftime("%H:%M"), round(float(r.open), 2), round(float(r.high), 2),
-                                     round(float(r.low), 2), round(float(r.close), 2)] for r in b.itertuples()][-90:]
-                except Exception:
-                    pass
-                reason = ("stop-loss" if pos["plpc"] <= ex["sl"] else
-                          "take-profit" if pos["plpc"] >= ex["tp"] else
-                          "max hold" if held >= ex["hold"] else
-                          "end of day" if now >= flatten else None)
-                if reason:
-                    market.close(t["contract"])
-                    reward = max(-1.0, min(1.0, pos["plpc"]))
-                    agent.learn_trade(t, reward, str(today))
-                    agent_stats.update(agent.stats())
-                    day["trades"] += 1
-                    day["wins"] += pos["pl"] > 0
-                    day["pl_usd"] = round(day["pl_usd"] + pos["pl"], 2)
-                    log_trade({"date": str(today), "opened": t["opened"], "closed": now.isoformat(timespec="seconds"),
-                               "symbol": t["symbol"], "contract": t["contract"], "action": t["action"],
-                               "qty": t["qty"], "entry": round(pos["entry"], 2), "pl_pct": round(pos["plpc"], 4),
-                               "pl_usd": round(pos["pl"], 2), "exit_reason": reason,
-                               "situation": t["situation"], "explored": t["explored"]})
-                    day["last_closed"] = {"closed": now.isoformat(timespec="seconds"), "symbol": t["symbol"],
-                                          "action": t["action"], "pl_usd": round(pos["pl"], 2),
-                                          "plpc": round(pos["plpc"], 4), "reason": reason}
+        try:
+            now = market.now()
+            t = day["open"]
+            if t:                                            # manage the open trade
+                pos = market.position(t["contract"])
+                if pos is None and (now - dt.datetime.fromisoformat(t["opened"])).total_seconds() < 120:
+                    status("waiting for fill")
+                elif pos is None:                            # never filled: give up on it
+                    market.cancel_orders(t["contract"])
                     day["open"] = None
-                    if day["wins"] >= WIN_TARGET:
-                        day["stopped"] = f"hit {WIN_TARGET} winners"
-                    elif day["trades"] >= MAX_TRADES:
-                        day["stopped"] = f"used all {MAX_TRADES} trades"
-                    if agent.mode == "table":
-                        agent.save()
-                status("in a trade" if day["open"] else "watching")
-        elif day["stopped"] is None:                     # maybe open a trade
-            guard_paused, guard_why = BR.halted(BOT_ID)
-            paused = (STATE_DIR / "options.PAUSE").exists() or guard_paused
-            room = DAILY_BUDGET - day["spent"]
-            if paused:
-                status(f"paused ({guard_why})" if guard_paused else "paused (options.PAUSE)")
-            elif now < first_entry:
-                status("watching (entries open at " + FIRST_ENTRY + ")")
-            elif now >= last_entry:
-                day["stopped"] = "past last entry time"
-            elif room < 50:
-                day["stopped"] = "daily budget used"
-            else:
-                # Model with signals: check every symbol each minute. Table agent: alternate.
-                if getattr(agent, "signal_mode", False):
-                    candidates = SYMBOLS
+                    day["spent"] = round(day["spent"] - t.get("cost", 0.0), 2)   # nothing bought: budget back
+                    if live:
+                        BR.record_order(BOT_ID, False, f"{t['contract']} not filled in 2 min")
+                    status("order did not fill, cancelled")
                 else:
-                    candidates = [SYMBOLS[turn % len(SYMBOLS)]]
-                    turn += 1
-                d = None
-                for symbol in candidates:
-                    bars = market.bars(symbol)
-                    d = agent.decide(symbol, bars, now, explore) if len(bars) else None
+                    if live and not t.get("fill_seen"):
+                        t["fill_seen"] = True; BR.record_order(BOT_ID, True)
+                    held = (now - dt.datetime.fromisoformat(t["opened"])).total_seconds() / 60
+                    t.update(plpc=round(pos["plpc"], 4), pl_usd=round(pos["pl"], 2), entry=pos["entry"])
+                    t.setdefault("path", []).append([now.strftime("%H:%M"), round(pos["plpc"], 4)])   # for the app's mini-chart
+                    del t["path"][:-240]
+                    try:                                     # underlying's 1-min candles since entry, for the app's monitor
+                        b = market.bars(t["symbol"])
+                        since = dt.datetime.fromisoformat(t["opened"]) - dt.timedelta(minutes=3)
+                        b = b[b["ts"] >= since]
+                        t["candles"] = [[r.ts.strftime("%H:%M"), round(float(r.open), 2), round(float(r.high), 2),
+                                         round(float(r.low), 2), round(float(r.close), 2)] for r in b.itertuples()][-90:]
+                    except Exception:
+                        pass
+                    reason = ("stop-loss" if pos["plpc"] <= ex["sl"] else
+                              "take-profit" if pos["plpc"] >= ex["tp"] else
+                              "max hold" if held >= ex["hold"] else
+                              "end of day" if now >= flatten else None)
+                    if reason and market.close(t["contract"]) is False:
+                        status(f"exit ({reason}) not confirmed yet, retrying")
+                        reason = None                        # still held: keep managing it, retry next minute
+                    if reason:
+                        reward = max(-1.0, min(1.0, pos["plpc"]))
+                        agent.learn_trade(t, reward, str(today))
+                        agent_stats.update(agent.stats())
+                        day["trades"] += 1
+                        day["wins"] += pos["pl"] > 0
+                        day["pl_usd"] = round(day["pl_usd"] + pos["pl"], 2)
+                        log_trade({"date": str(today), "opened": t["opened"], "closed": now.isoformat(timespec="seconds"),
+                                   "symbol": t["symbol"], "contract": t["contract"], "action": t["action"],
+                                   "qty": t["qty"], "entry": round(pos["entry"], 2), "pl_pct": round(pos["plpc"], 4),
+                                   "pl_usd": round(pos["pl"], 2), "exit_reason": reason,
+                                   "situation": t["situation"], "explored": t["explored"]})
+                        day["last_closed"] = {"closed": now.isoformat(timespec="seconds"), "symbol": t["symbol"],
+                                              "action": t["action"], "pl_usd": round(pos["pl"], 2),
+                                              "plpc": round(pos["plpc"], 4), "reason": reason}
+                        day["open"] = None
+                        if day["wins"] >= WIN_TARGET:
+                            day["stopped"] = f"hit {WIN_TARGET} winners"
+                        elif day["trades"] >= MAX_TRADES:
+                            day["stopped"] = f"used all {MAX_TRADES} trades"
+                        if agent.mode == "table":
+                            agent.save()
+                    status("in a trade" if day["open"] else "watching")
+            elif day["stopped"] is None:                     # maybe open a trade
+                guard_paused, guard_why = BR.halted(BOT_ID)
+                paused = (STATE_DIR / "options.PAUSE").exists() or guard_paused
+                room = DAILY_BUDGET - day["spent"]
+                if paused:
+                    status(f"paused ({guard_why})" if guard_paused else "paused (options.PAUSE)")
+                elif now < first_entry:
+                    status("watching (entries open at " + FIRST_ENTRY + ")")
+                elif now >= last_entry:
+                    day["stopped"] = "past last entry time"
+                elif room < 50:
+                    day["stopped"] = "daily budget used"
+                else:
+                    # Model with signals: check every symbol each minute. Table agent: alternate.
+                    if getattr(agent, "signal_mode", False):
+                        candidates = SYMBOLS
+                    else:
+                        candidates = [SYMBOLS[turn % len(SYMBOLS)]]
+                        turn += 1
+                    d = None
+                    for symbol in candidates:
+                        bars = market.bars(symbol)
+                        d = agent.decide(symbol, bars, now, explore) if len(bars) else None
+                        if d:
+                            break
                     if d:
-                        break
-                if d:
-                    closes = bars["close"].tolist()
-                    sit, explored = d["situation"], d["explored"]
-                    action = ACTIONS[d["action"]]
-                    day["last_decision"] = {"time": now.isoformat(timespec="seconds"), "situation": sit,
-                                            "action": action, "explored": explored, "preds": d["preds"]}
-                    if action != "skip":
-                        kind, dte = action.split("_")
-                        contract = market.pick_contract(symbol, kind, expiry[dte], closes[-1])
-                        price = market.ask(contract) if contract else None
-                        qty = int(min(PER_TRADE, room) // (price * 100)) if price else 0
-                        if qty >= 1:
-                            market.buy(contract, qty)
-                            day["spent"] = round(day["spent"] + qty * price * 100, 2)
-                            day["open"] = {"symbol": symbol, "contract": contract, "action": action, "qty": qty,
-                                           "opened": now.isoformat(timespec="seconds"), "situation": sit,
-                                           "features": d["features"], "explored": explored,
-                                           "plpc": 0.0, "pl_usd": 0.0, "u_entry": round(float(closes[-1]), 2)}
-                        else:
-                            day["last_decision"]["note"] = "too expensive or no contract"
-                status("in a trade" if day["open"] else
-                       "watching for setups" if getattr(agent, "signal_mode", False) else "watching")
-        else:
-            if now >= flatten:
-                break
-            status(f"done for the day ({day['stopped']})")
+                        closes = bars["close"].tolist()
+                        sit, explored = d["situation"], d["explored"]
+                        action = ACTIONS[d["action"]]
+                        day["last_decision"] = {"time": now.isoformat(timespec="seconds"), "situation": sit,
+                                                "action": action, "explored": explored, "preds": d["preds"]}
+                        if action != "skip":
+                            kind, dte = action.split("_")
+                            contract = market.pick_contract(symbol, kind, expiry[dte], closes[-1])
+                            price = market.ask(contract) if contract else None
+                            qty = int(min(PER_TRADE, room) // (price * 100)) if price else 0
+                            cap = BR.size_cap(BOT_ID) if live else None
+                            if cap is not None:
+                                qty = min(qty, cap)          # new order code: minimum size on its first live day
+                            sent = False
+                            if qty >= 1:
+                                try:
+                                    market.buy(contract, qty); sent = True
+                                except Exception as exc:     # rejected: nothing bought
+                                    if live:
+                                        BR.record_order(BOT_ID, False, f"rejected: {type(exc).__name__}: {str(exc)[:100]}")
+                                    day["last_decision"]["note"] = f"order rejected: {exc}"
+                            if sent:
+                                day["spent"] = round(day["spent"] + qty * price * 100, 2)
+                                day["open"] = {"symbol": symbol, "contract": contract, "action": action, "qty": qty,
+                                               "opened": now.isoformat(timespec="seconds"), "situation": sit,
+                                               "features": d["features"], "explored": explored,
+                                               "plpc": 0.0, "pl_usd": 0.0, "u_entry": round(float(closes[-1]), 2),
+                                               "cost": round(qty * price * 100, 2)}
+                            elif qty < 1:
+                                day["last_decision"]["note"] = "too expensive or no contract"
+                    status("in a trade" if day["open"] else
+                           "watching for setups" if getattr(agent, "signal_mode", False) else "watching")
+            else:
+                if now >= flatten:
+                    break
+                status(f"done for the day ({day['stopped']})")
+            errors = 0
+        except Exception as exc:                         # a data/API blip must not kill the bot for the day
+            errors += 1
+            print(f"loop error {errors}: {type(exc).__name__}: {exc}", flush=True)
+            try:
+                status(f"error, retrying ({type(exc).__name__}: {str(exc)[:80]})")
+            except Exception:
+                pass
+            if live and errors == 5:
+                BR.set_halt(BOT_ID, f"5 errors in a row ({type(exc).__name__})", until=str(today))
+                notify(f"{BOT_ID}: 5 errors in a row, new entries paused for today; still managing any open trade "
+                       f"(last: {type(exc).__name__}: {str(exc)[:120]})", priority=5)
         market.sleep(CHECK_EVERY_S)
 
     if day["open"]:                                      # safety: never hold overnight
-        market.close(day["open"]["contract"])
+        for _ in range(5):
+            if market.close(day["open"]["contract"]) is not False:
+                break
+            market.sleep(30)
+        else:
+            notify(f"{BOT_ID}: could not confirm the end-of-day close of {day['open']['contract']} "
+                   f"(the risk guard keeps trying)", priority=5)
         day["open"] = None
 
     status("training overnight")

@@ -3,15 +3,18 @@ and that no bot (or the whole account) loses more than its hard limit. It never 
 
 Every minute (9:25-16:20 New York, weekdays):
   1. Unclaimed option positions: an option held at Alpaca that no bot claims (claims: risk/claims/<bot>.json)
-     for 3+ minutes -> pause ALL new entries for the day, close the position, alert.
+     for 3+ minutes -> close the position, alert, and pause ONLY the bot whose order bought it (found from the
+     tag in the order id). Everything is paused only if the owner can't be identified.
   2. Ghost claims: a bot claims a position Alpaca doesn't have, for 5+ minutes -> alert.
   3. Per-bot daily loss limit (realized today + open P&L of its positions):
         experiments (proving ground) $1,000 · options bots $2,500 each
      -> close that bot's positions, pause it for the rest of the day, alert.
   4. Whole account down 3%+ on the day -> close every option position, pause everything for the day, alert.
      (The portfolio's long-term ETFs are NOT force-sold: selling them in a dip is the wrong move.)
-  --smoke (9:31 NY): a live round trip on Alpaca paper with 1 share of SGOV (an ETF no bot holds): buy,
-     confirm by position, sell, confirm gone. If the order path doesn't work, everything is paused.
+  5. From 10 min before the close (15:50 NY on normal days): any option still held is closed (every bot should be flat by 15:45; nothing is held overnight).
+  --smoke (9:35 NY): a live round trip on Alpaca paper with 1 share of SGOV (an ETF no bot holds): buy,
+     confirm by position, sell, confirm gone. Alert-only: a failure never pauses the bots.
+Every pause expires at the end of the day, so each bot starts fresh the next morning on its own.
 Status for the app/watchdog: risk/status.json. Pauses: risk/halt.json (bots check it before every entry).
 """
 from __future__ import annotations
@@ -97,11 +100,15 @@ def run(tc, now: dt.datetime) -> dict:
             state["seen"].pop(sym, None); continue
         first = state["seen"].setdefault(sym, ts)
         if ts - first >= ORPHAN_GRACE_MIN * 60:
-            B.set_halt("all", f"unclaimed position {sym}", until=today)
+            who = B.owner_of(tc, sym)
+            key = who if who in BOTS else "all"
+            B.set_halt(key, f"unclaimed position {sym}", until=today)
             px = br.sell(sym)
+            scope = f"{who} paused for today (it placed the order); the other bots keep trading" if key != "all" else \
+                    "owner unknown, so all new entries are paused for today"
             once(f"orphan-{sym}", "Risk guard: unclaimed position closed",
                  f"{sym} x{p.qty} was held at Alpaca but no bot claimed it for {ORPHAN_GRACE_MIN}+ min. "
-                 f"Closed it{f' at ${px:.2f}' if px else ' (close not confirmed yet, retrying)'}; all new entries paused for today.")
+                 f"Closed it{f' at ${px:.2f}' if px else ' (close not confirmed yet, retrying)'}; {scope}.")
     for sym in list(state["seen"]):
         if sym not in held_opts:
             state["seen"].pop(sym)
@@ -138,6 +145,18 @@ def run(tc, now: dt.datetime) -> dict:
         once("account-limit", "Risk guard: account limit hit",
              f"Account is down {dd:.1%} today (limit {ACCOUNT_LIMIT:.0%}). Closed all options ({', '.join(closed) or 'none'}); "
              f"every bot paused until tomorrow. Portfolio ETFs kept.")
+    # 5. end of day (10 min before the close, so half days work too): nothing is held overnight
+    try:
+        nc = getattr(tc.get_clock(), "next_close", None)
+    except Exception:
+        nc = None
+    eod = (nc - now).total_seconds() <= 600 if nc else now.time() >= dt.time(15, 50)
+    if eod:
+        for sym in list(held_opts):
+            px = br.sell(sym)
+            once(f"eod-{sym}", "Risk guard: option still open at 3:50",
+                 f"{sym} (claimed by {owner.get(sym, 'no bot')}) was still open at 3:50 NY. "
+                 f"Closed it{f' at ${px:.2f}' if px else ' (not confirmed yet, retrying every minute)'}.")
     paused_all, why_all = B.halted("all")
     out = {"updated": now.isoformat(timespec="seconds"), "ok": not state["seen"] and not paused_all,
            "account": {"equity": round(eq, 2), "change": round(eq - last, 2), "change_pct": round(dd, 4), "limit_pct": ACCOUNT_LIMIT},

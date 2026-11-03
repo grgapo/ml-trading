@@ -187,7 +187,7 @@ class LiveMarket:
         return self.broker.held(contract)
 
     def buy(self, contract: str, qty: int):
-        got = self.broker.buy(contract, qty, "pg")
+        got = self.broker.buy(contract, qty, "pg", bot="proving")   # no-fill streak pauses only the proving ground
         return (got[0], int(got[1])) if got else None
 
     def sell(self, contract: str, qty: int):

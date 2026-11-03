@@ -15,8 +15,9 @@ class NoPosition(Exception):
 
 
 class FakeTradingClient:
-    def __init__(self, price=2.0, fill_delay=0.0, fill="full"):
+    def __init__(self, price=2.0, fill_delay=0.0, fill="full", stuck_sells=0, reject_buys=False):
         self.price, self.fill_delay, self.fill = price, fill_delay, fill   # fill: full | none | partial
+        self.stuck_sells, self.reject_buys = stuck_sells, reject_buys     # first N sells never fill; buys rejected
         self.positions: dict[str, list] = {}       # symbol -> [qty, avg]
         self.orders: list[SimpleNamespace] = []
         self.ids = itertools.count(1)
@@ -35,8 +36,13 @@ class FakeTradingClient:
 
     # orders
     def submit_order(self, req):
+        if self.reject_buys and req.side == OrderSide.BUY:
+            raise RuntimeError("APIError: insufficient buying power")
         o = SimpleNamespace(id=next(self.ids), symbol=req.symbol, qty=float(req.qty), side=req.side, status=OrderStatus.NEW,
-                            filled_avg_price=None, created=time.time())
+                            filled_avg_price=None, created=time.time(), client_order_id=getattr(req, "client_order_id", None),
+                            stuck=False)
+        if req.side == OrderSide.SELL and self.stuck_sells > 0:
+            o.stuck = True; self.stuck_sells -= 1
         self.orders.append(o); return o
 
     def close_position(self, symbol):
@@ -51,7 +57,7 @@ class FakeTradingClient:
         self._process()
         st = str(getattr(req.status, "value", req.status)).lower()
         want_open = st == "open"
-        out = [o for o in self.orders if (o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)) == want_open
+        out = [o for o in self.orders if (st == "all" or (o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)) == want_open)
                and (not req.symbols or o.symbol in req.symbols)]
         return list(reversed(out))[: (req.limit or 500)]
 
@@ -66,7 +72,7 @@ class FakeTradingClient:
 
     def _process(self):
         for o in self.orders:
-            if o.status is not OrderStatus.NEW or time.time() - o.created < self.fill_delay:
+            if o.status is not OrderStatus.NEW or time.time() - o.created < self.fill_delay or o.stuck:
                 continue
             if o.side == OrderSide.BUY and self.fill == "none":
                 continue
