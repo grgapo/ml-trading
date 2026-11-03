@@ -148,25 +148,39 @@ def run(tc, now: dt.datetime) -> dict:
     return out
 
 
+SMOKE_CONFIRM_S = int(os.environ.get("RISK_SMOKE_CONFIRM_S", "180"))
+SMOKE_TRIES = int(os.environ.get("RISK_SMOKE_TRIES", "2"))
+SMOKE_RETRY_S = float(os.environ.get("RISK_SMOKE_RETRY_S", "60"))
+
+
 def smoke(tc, now) -> bool:
-    br = B.Broker(tc)
-    today = str(now.date())
-    try:
-        got = br.buy(SMOKE_SYMBOL, 1, "smoke")
-        ok_buy = got is not None and got[1] >= 1
-        px = br.sell(SMOKE_SYMBOL, 1) if ok_buy else None
-        ok = ok_buy and px is not None and br.held(SMOKE_SYMBOL) is None
-        detail = f"bought 1 {SMOKE_SYMBOL} at {got[0] if got else '?'}, sold at {px}" if ok else \
-                 f"buy confirmed: {ok_buy}, sell confirmed: {px is not None}"
-    except Exception as exc:
-        ok, detail = False, f"{type(exc).__name__}: {exc}"
-    B._save(RISK / "smoke.json", {"updated": now.isoformat(timespec="seconds"), "ok": ok, "detail": detail})
+    """Live 1-share round trip. ALERT-ONLY: a failure sends ntfy but never pauses the bots.
+    (Nov 3: a 60 s window at 9:31 missed a paper fill and halted the whole day for nothing.)"""
+    import time as _time
+    br = B.Broker(tc, confirm_s=SMOKE_CONFIRM_S)
+    ok, detail, attempt = False, "", 0
+    for attempt in range(1, SMOKE_TRIES + 1):
+        try:
+            if br.held(SMOKE_SYMBOL):                 # a late fill from a cancelled try: sell it first
+                br.sell(SMOKE_SYMBOL)
+            got = br.buy(SMOKE_SYMBOL, 1, "smoke")
+            ok_buy = got is not None and got[1] >= 1
+            px = br.sell(SMOKE_SYMBOL) if ok_buy else None
+            ok = ok_buy and px is not None and br.held(SMOKE_SYMBOL) is None
+            detail = (f"bought 1 {SMOKE_SYMBOL} at {got[0]}, sold at {px}" if ok else
+                      f"buy confirmed: {ok_buy}, sell confirmed: {px is not None}")
+        except Exception as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        if ok:
+            break
+        if attempt < SMOKE_TRIES:
+            _time.sleep(SMOKE_RETRY_S)
+    B._save(RISK / "smoke.json", {"updated": now.isoformat(timespec="seconds"), "ok": ok,
+                                  "detail": detail, "attempts": attempt, "alert_only": True})
     if not ok:
-        B.set_halt("all", f"morning order test failed ({detail})", until=today)
-        notify("Risk guard: order test FAILED", f"This morning's live order test on Alpaca paper failed ({detail}). "
-                                                f"All new entries are paused for today.")
-    else:
-        print(f"order test passed: {detail}", flush=True)
+        notify("Risk guard: order test failed (bots NOT paused)",
+               f"Morning live order test failed after {attempt} tries ({detail}). Bots keep trading; "
+               f"the risk guard's position and loss checks still apply. Worth a look.")
     return ok
 
 
