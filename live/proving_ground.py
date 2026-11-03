@@ -364,6 +364,13 @@ class OrbCalm:
                 u = float(d["c"][d["seen"] - 1]); sgn = 1 if st["side"] == "call" else -1
                 gain = sgn * (u - st["entry_u"]); st["best"] = max(st["best"], gain)
                 st["path"].append([self.mk.now().strftime("%H:%M"), round(gain / st["atr"], 2)])
+                try:                                          # real 1-min candles since entry, for the app's monitor
+                    since = pd.Timestamp(st["opened"]) - pd.Timedelta(minutes=3)
+                    b = bars[pd.to_datetime(bars["ts"]) >= since]
+                    st["candles"] = [[pd.Timestamp(r.ts).strftime("%H:%M"), round(float(r.open), 2), round(float(r.high), 2),
+                                      round(float(r.low), 2), round(float(r.close), 2)] for r in b.itertuples()][-90:]
+                except Exception:
+                    pass
                 why = None
                 if gain <= -self.STOP * st["atr"]:
                     why = "safety stop"
