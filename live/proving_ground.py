@@ -286,6 +286,7 @@ class OrbCalm:
         self.exp, self.mk = exp, market
         self.hist = {s: [d for d in ORB.load_days(s) if d["date"] < market.today] for s in exp["symbols"]}
         self.state = {s: {"phase": "waiting for 10:00"} for s in exp["symbols"]}
+        self.shadow = exp.get("mode") == "shadow"            # live decisions + live quotes, NEVER an order
         self.model, self.threshold = self._train()
 
     def _train(self):
@@ -345,11 +346,15 @@ class OrbCalm:
                     cap = BR.size_cap("proving")
                     if cap is not None:
                         qty = min(qty, cap)                   # new order code: minimum size until it has proven itself
-                    got = self.mk.buy(contract, qty) if qty > 0 else None
+                    if self.shadow:                           # record at the live ask; nothing is sent to the broker
+                        got = (ask, qty) if qty > 0 else None
+                    else:
+                        got = self.mk.buy(contract, qty) if qty > 0 else None
                     if not got:
                         st["phase"] = "done for today"; st["note"] = "buy didn't fill (no position at the broker)"; continue
                     fill, qty = got
-                    remember_open(contract, self.exp["id"], sym)
+                    if not self.shadow:
+                        remember_open(contract, self.exp["id"], sym)
                     st.update(phase="in a trade", side=side, contract=contract, qty=qty, entry=fill, atr=atr,
                               entry_u=float(d["c"][min(minute, d["seen"]) - 1]), entry_min=minute, best=0.0,
                               opened=self.mk.now().isoformat(timespec="seconds"), path=[])
@@ -367,11 +372,14 @@ class OrbCalm:
                 elif minute >= ORB.FLAT:
                     why = "3:45 exit"
                 if why:
-                    px = self.mk.sell(st["contract"], st["qty"])
-                    if px is None and self.mk.held(st["contract"]):
-                        st["note"] = "sell not confirmed yet, retrying next minute"; continue
-                    px = px or self.mk.option_price(st["contract"], "sell") or 0.0
-                    forget_open(st["contract"])
+                    if self.shadow:                           # record at the live bid; nothing is sent to the broker
+                        px = self.mk.option_price(st["contract"], "sell") or 0.0
+                    else:
+                        px = self.mk.sell(st["contract"], st["qty"])
+                        if px is None and self.mk.held(st["contract"]):
+                            st["note"] = "sell not confirmed yet, retrying next minute"; continue
+                        px = px or self.mk.option_price(st["contract"], "sell") or 0.0
+                        forget_open(st["contract"])
                     pnl = round(st["qty"] * 100 * (px - st["entry"]), 2)
                     log_trade({"date": str(self.mk.today), "experiment": self.exp["id"], "symbol": sym, "side": st["side"],
                                "contract": st["contract"], "qty": st["qty"], "entry_time": st["opened"],
@@ -484,7 +492,8 @@ def main() -> int:
             except Exception as exc:
                 log.append(f"{market.now():%H:%M} {rid}: error {type(exc).__name__}: {exc}"); print(log[-1], flush=True)
         if not args.replay:
-            hold = {st["contract"]: st["qty"] for r in runners.values() for st in r.state.values() if st.get("phase") == "in a trade"}
+            hold = {st["contract"]: st["qty"] for r in runners.values() if not getattr(r, "shadow", False)
+                    for st in r.state.values() if st.get("phase") == "in a trade"}
             f = open_file()
             for c in (json.loads(f.read_text()) if f.exists() else {}):
                 hold.setdefault(c, (market.held(c) or (0,))[0])

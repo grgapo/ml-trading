@@ -56,7 +56,8 @@ def realized_today(path: Path, col: str, today: str) -> float:
     if not path.exists():
         return 0.0
     try:
-        return sum(float(r.get(col) or 0) for r in csv.DictReader(path.open()) if r.get("date") == today)
+        return sum(float(r.get(col) or 0) for r in csv.DictReader(path.open())
+                   if r.get("date") == today and not str(r.get("experiment", "")).endswith("-shadow"))   # shadow = no orders
     except Exception:
         return 0.0
 

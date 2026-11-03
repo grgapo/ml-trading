@@ -54,6 +54,14 @@ G.run(c, T0)
 check("realized losses today (-$1,100) trip the experiment limit; yesterday's don't count", B.halted("proving")[0] is True)
 log.unlink()
 
+# shadow trades (no orders) never count toward the real loss limit
+fresh(); c = FakeWithAccount()
+log = B.RISK.parent / "proving" / "trades.csv"; log.parent.mkdir(parents=True, exist_ok=True)
+log.write_text("date,experiment,pnl\n2026-11-03,orb-calm-iwm-shadow,-3000\n2026-11-03,orb-calm,-200\n")
+G.run(c, T0)
+check("shadow losses don't trip the experiments' real loss limit", B.halted("proving")[0] is False)
+log.unlink()
+
 # whole account -3%
 fresh(); c = FakeWithAccount(equity=96500, last_equity=100000); c.hold("QQQ261103C00697000", 8, 5.69, upl=-100)
 B.write_claims("options-qqq", {"QQQ261103C00697000": 8}); c.hold("USO", 94, 158.0)
