@@ -41,6 +41,7 @@ NY = ZoneInfo("America/New_York")
 
 # ---- settings (override in ~/.config/paper-bot.env) ---------------------------
 SYMBOLS = os.environ.get("OPT_SYMBOLS", "SPY,QQQ").replace(" ", "").split(",")
+import broker as BR  # noqa: E402  (shared risk hooks: pauses + claims)
 DAILY_BUDGET = float(os.environ.get("OPT_DAILY_BUDGET", "5000"))
 MAX_TRADES = int(os.environ.get("OPT_MAX_TRADES", "5"))
 WIN_TARGET = int(os.environ.get("OPT_WIN_TARGET", "3"))
@@ -57,6 +58,7 @@ MODEL_EXPLORATION = float(os.environ.get("OPT_MODEL_EXPLORATION", "0.10"))  # on
 LIVE_WEIGHT = float(os.environ.get("OPT_LIVE_WEIGHT", "5"))  # a real paper trade counts 5x a simulated one
 REPLAY_SWEEPS = int(os.environ.get("OPT_REPLAY_SWEEPS", "20000"))
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path.home() / "projects" / "paper-state"))
+BOT_ID = STATE_DIR.name if STATE_DIR.name.startswith("options-") else "options"
 
 ACTIONS = ["skip", "call_1dte", "put_1dte", "call_0dte", "put_0dte"]
 
@@ -507,6 +509,7 @@ class AlpacaMarket:
 
 class SimMarket:
     """Fake market for testing: random-walk prices, simple option pricing, fast clock."""
+    simulated = True                                    # never publishes claims to the real risk guard
 
     def __init__(self, date: dt.date, seed: int = 0) -> None:
         self.rng = random.Random(seed or date.toordinal())
@@ -645,6 +648,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
 
     def status(phase):
         open_t = {k: v for k, v in (day["open"] or {}).items() if k != "features"} or None
+        if not getattr(market, "simulated", False):           # tell the risk guard what this bot holds
+            BR.write_claims(BOT_ID, {day["open"]["contract"]: day["open"]["qty"]} if day["open"] else {})
         write_status(phase=phase, session=str(today), max_trades=MAX_TRADES, win_target=WIN_TARGET,
                      budget=DAILY_BUDGET, exits=ex, **{k: v for k, v in day.items() if k not in ("date", "open")},
                      open=open_t, agent=agent_stats)
@@ -706,10 +711,11 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                         agent.save()
                 status("in a trade" if day["open"] else "watching")
         elif day["stopped"] is None:                     # maybe open a trade
-            paused = (STATE_DIR / "options.PAUSE").exists()
+            guard_paused, guard_why = BR.halted(BOT_ID)
+            paused = (STATE_DIR / "options.PAUSE").exists() or guard_paused
             room = DAILY_BUDGET - day["spent"]
             if paused:
-                status("paused (options.PAUSE)")
+                status(f"paused ({guard_why})" if guard_paused else "paused (options.PAUSE)")
             elif now < first_entry:
                 status("watching (entries open at " + FIRST_ENTRY + ")")
             elif now >= last_entry:

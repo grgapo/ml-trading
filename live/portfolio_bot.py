@@ -61,6 +61,11 @@ def main() -> int:
     status = "waiting for research" if not champ else "holding"
     due = champ and clock.is_open and (book["last_rebalance"] is None or book["last_rebalance"][:7] != today[:7]
                                        or book["champion"] != champ["desc"])
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import broker as BR
+    paused, why = BR.halted("portfolio")
+    if due and paused:
+        status = f"rebalance waiting ({why})"; due = False
     if due:
         status = "rebalancing"
         target = P.target_weights(px, champ["params"])

@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import broker as BR  # noqa: E402
 import features  # noqa: E402
 import orb_backtest as ORB  # noqa: E402
 import trend_days as TD  # noqa: E402
@@ -50,11 +51,12 @@ FIELDS = ["date", "experiment", "symbol", "side", "contract", "qty", "entry_time
 DEFAULT_EXPERIMENTS = [{
     "id": "orb-calm", "name": "Opening range · calm days",
     "description": "Opening-range breakout + noise band + VWAP, only on days the calm-day predictor rates calm.",
-    "symbols": ["SPY", "QQQ"], "stake": 5000, "status": "incubating", "started": None,
-    "expectation": {"mean_per_trade": 563.0, "profit_factor": 1.8, "trades_per_month": 5.8,
+    "symbols": ["SPY", "QQQ"], "stake": 2000, "status": "incubating", "started": None,
+    "expectation": {"mean_per_trade": 225.0, "profit_factor": 1.8, "trades_per_month": 5.8,
                     "source": "trend_days.py walk-forward, skipped (calm) days, Nov 2024 - Oct 2026"},
 }]
-MIN_TRADES, MIN_WEEKS, MAX_LOSS = 30, 8, 15000.0
+MIN_TRADES, MIN_WEEKS, MAX_LOSS = 30, 8, 5000.0      # experiments are retired at -$5,000 lifetime
+EXPERIMENT_STAKE_CAP = 2000.0                            # hard cap per trade for any experiment
 
 
 def notify(text: str) -> None:
@@ -78,6 +80,12 @@ def registry() -> list[dict]:
     for e in DEFAULT_EXPERIMENTS:                              # new experiments join automatically
         if e["id"] not in have:
             reg.append({**e, "started": str(dt.date.today())})
+    for e in reg:                                             # the hard cap applies to every experiment
+        if float(e.get("stake", 0)) > EXPERIMENT_STAKE_CAP:
+            scale = EXPERIMENT_STAKE_CAP / float(e["stake"])
+            e["stake"] = EXPERIMENT_STAKE_CAP
+            if (e.get("expectation") or {}).get("mean_per_trade"):
+                e["expectation"]["mean_per_trade"] = round(e["expectation"]["mean_per_trade"] * scale, 2)
     save(REGISTRY, reg)
     return reg
 
@@ -136,6 +144,7 @@ class LiveMarket:
         k, s = os.environ["ALPACA_API_KEY_ID"], os.environ["ALPACA_API_SECRET_KEY"]
         self.stocks, self.options = StockHistoricalDataClient(k, s), OptionHistoricalDataClient(k, s)
         self.trading = TradingClient(k, s, paper=True)
+        self.broker = BR.Broker(self.trading)
         self.today = dt.datetime.now(NY).date()
 
     def now(self) -> dt.datetime:
@@ -175,49 +184,14 @@ class LiveMarket:
         return float(q.ask_price if side == "buy" else q.bid_price) or None
 
     def held(self, contract: str):
-        try:
-            p = self.trading.get_open_position(contract)
-            return float(p.qty), float(p.avg_entry_price)
-        except Exception:
-            return None
-
-    def _cancel_open(self, contract: str) -> None:
-        from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-        for o in self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[contract])):
-            self.trading.cancel_order_by_id(o.id)
+        return self.broker.held(contract)
 
     def buy(self, contract: str, qty: int):
-        """Market buy; returns (fill price, qty) confirmed by the actual position at Alpaca, or None."""
-        from alpaca.trading.enums import OrderSide, TimeInForce
-        from alpaca.trading.requests import MarketOrderRequest
-        self.trading.submit_order(MarketOrderRequest(symbol=contract, qty=qty, side=OrderSide.BUY,
-                                                     time_in_force=TimeInForce.DAY,
-                                                     client_order_id=f"pg-{contract}-buy-{int(time.time())}"))
-        for _ in range(60):
-            h = self.held(contract)
-            if h and h[0] > 0:
-                return h[1], int(h[0])
-            time.sleep(1)
-        self._cancel_open(contract)
-        time.sleep(2)
-        h = self.held(contract)                         # filled while we were cancelling?
-        return (h[1], int(h[0])) if h and h[0] > 0 else None
+        got = self.broker.buy(contract, qty, "pg")
+        return (got[0], int(got[1])) if got else None
 
     def sell(self, contract: str, qty: int):
-        """Close the position; returns the exit price once the position is confirmed gone, or None."""
-        from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-        if not self.held(contract):
-            return None
-        self.trading.close_position(contract)
-        for _ in range(60):
-            if not self.held(contract):
-                orders = self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[contract], limit=5))
-                fills = [float(o.filled_avg_price) for o in orders if o.filled_avg_price and getattr(o.side, "value", str(o.side)).lower() == "sell"]
-                return fills[0] if fills else self.option_price(contract, "sell")
-            time.sleep(1)
-        return None
+        return self.broker.sell(contract, None, fallback_price=lambda: self.option_price(contract, "sell"))
 
 
 class ReplayMarket:
@@ -352,6 +326,10 @@ class OrbCalm:
                                                    f"(score {p:.3f} vs {self.threshold:.3f})"})
                 continue
             if st["phase"] == "watching for a breakout":
+                paused, why = BR.halted("proving")
+                if paused:
+                    st["note"] = why; continue                # no new entries; exits are never blocked
+                st.pop("note", None)
                 if minute > max(ORB.CHECKS) + 2:
                     st["phase"] = "no signal today"; continue
                 sg = ORB.signal(d, self.BAND)
@@ -364,6 +342,9 @@ class OrbCalm:
                     if not ask or ask < 0.10:
                         st["phase"] = "done for today"; st["note"] = f"no price for {contract}"; continue
                     qty = int(self.exp["stake"] // (ask * 100))
+                    cap = BR.size_cap("proving")
+                    if cap is not None:
+                        qty = min(qty, cap)                   # new order code: minimum size until it has proven itself
                     got = self.mk.buy(contract, qty) if qty > 0 else None
                     if not got:
                         st["phase"] = "done for today"; st["note"] = "buy didn't fill (no position at the broker)"; continue
@@ -487,6 +468,8 @@ def main() -> int:
     if not args.replay:                                       # wait for the open
         while market.now().time() < dt.time(9, 31):
             write_status(reg, runners, "waiting for the open", log, market); time.sleep(20)
+        f = open_file()
+        BR.write_claims("proving", {c: (market.held(c) or (0,))[0] for c in (json.loads(f.read_text()) if f.exists() else {})})
         close_leftovers(market, log, "at the open (held overnight)")
     else:
         market.minute = 1
@@ -500,11 +483,18 @@ def main() -> int:
                     line = f"{market.now():%H:%M} {ev['text']}"; log.append(line); print(line, flush=True)
             except Exception as exc:
                 log.append(f"{market.now():%H:%M} {rid}: error {type(exc).__name__}: {exc}"); print(log[-1], flush=True)
+        if not args.replay:
+            hold = {st["contract"]: st["qty"] for r in runners.values() for st in r.state.values() if st.get("phase") == "in a trade"}
+            f = open_file()
+            for c in (json.loads(f.read_text()) if f.exists() else {}):
+                hold.setdefault(c, (market.held(c) or (0,))[0])
+            BR.write_claims("proving", hold)
         busy = any(st.get("phase") == "in a trade" for r in runners.values() for st in r.state.values())
         write_status(reg, runners, "in a trade" if busy else "watching", log, market)
         market.wait_next_minute()
     if not args.replay:
         close_leftovers(market, log, "after the session (should have closed by 3:45)")
+        BR.write_claims("proving", {})
     lifecycle(reg, read_trades())
     write_status(reg, runners, "session over", log, market)
     print(f"{market.today}: session over · " + " · ".join(f"{e['name']}: {e['status']}" for e in reg), flush=True)
