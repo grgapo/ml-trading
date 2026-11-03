@@ -349,7 +349,7 @@ class OrbCalm:
                     if not got:
                         st["phase"] = "done for today"; st["note"] = "buy didn't fill (no position at the broker)"; continue
                     fill, qty = got
-                    remember_open(contract, self.ID, sym)
+                    remember_open(contract, self.exp["id"], sym)
                     st.update(phase="in a trade", side=side, contract=contract, qty=qty, entry=fill, atr=atr,
                               entry_u=float(d["c"][min(minute, d["seen"]) - 1]), entry_min=minute, best=0.0,
                               opened=self.mk.now().isoformat(timespec="seconds"), path=[])
@@ -373,7 +373,7 @@ class OrbCalm:
                     px = px or self.mk.option_price(st["contract"], "sell") or 0.0
                     forget_open(st["contract"])
                     pnl = round(st["qty"] * 100 * (px - st["entry"]), 2)
-                    log_trade({"date": str(self.mk.today), "experiment": self.ID, "symbol": sym, "side": st["side"],
+                    log_trade({"date": str(self.mk.today), "experiment": self.exp["id"], "symbol": sym, "side": st["side"],
                                "contract": st["contract"], "qty": st["qty"], "entry_time": st["opened"],
                                "entry_price": st["entry"], "exit_time": self.mk.now().isoformat(timespec="seconds"),
                                "exit_price": px, "pnl": pnl, "pct": round(px / st["entry"] - 1, 4), "exit_reason": why,
@@ -460,9 +460,9 @@ def main() -> int:
         write_status(reg, {}, "market closed today", log, market); return 0
     runners = {}
     for e in reg:
-        if e["status"] in ("incubating", "ready for review") and e["id"] in IMPLEMENTATIONS:
+        if e["status"] in ("incubating", "ready for review") and e.get("impl", e["id"]) in IMPLEMENTATIONS:
             try:
-                runners[e["id"]] = IMPLEMENTATIONS[e["id"]](e, market)
+                runners[e["id"]] = IMPLEMENTATIONS[e.get("impl", e["id"])](e, market)
             except Exception as exc:
                 log.append(f"{e['name']}: couldn't start ({type(exc).__name__}: {exc})")
     if not args.replay:                                       # wait for the open
