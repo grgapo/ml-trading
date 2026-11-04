@@ -54,9 +54,36 @@ DEFAULT_EXPERIMENTS = [{
     "symbols": ["SPY", "QQQ"], "stake": 2000, "status": "incubating", "started": None,
     "expectation": {"mean_per_trade": 225.0, "profit_factor": 1.8, "trades_per_month": 5.8,
                     "source": "trend_days.py walk-forward, skipped (calm) days, Nov 2024 - Oct 2026"},
+}, {
+    "id": "orb-daily", "impl": "orb-calm", "calm_filter": False, "name": "Opening range · every day",
+    "description": "Same opening-range breakout + noise band + VWAP, traded every day (no calm-day filter), SPY, QQQ and IWM.",
+    "symbols": ["SPY", "QQQ", "IWM"], "stake": 1250, "status": "incubating", "started": None,
+    "expectation": None,
 }]
 MIN_TRADES, MIN_WEEKS, MAX_LOSS = 30, 8, 5000.0      # experiments are retired at -$5,000 lifetime
 EXPERIMENT_STAKE_CAP = 2000.0                            # hard cap per trade for any experiment
+DAILY_BUDGET = float(os.environ.get("PROVING_DAILY_BUDGET", "2500"))   # shared by every experiment that places orders
+
+
+def budget_left(today) -> float:
+    f = STATE / "budget.json"
+    try:
+        b = json.loads(f.read_text()) if f.exists() else {}
+    except Exception:
+        b = {}
+    return DAILY_BUDGET - (float(b.get("spent", 0)) if b.get("day") == str(today) else 0.0)
+
+
+def budget_spend(today, amount: float) -> None:
+    f = STATE / "budget.json"
+    try:
+        b = json.loads(f.read_text()) if f.exists() else {}
+    except Exception:
+        b = {}
+    if b.get("day") != str(today):
+        b = {"day": str(today), "spent": 0.0}
+    b["spent"] = round(float(b.get("spent", 0)) + amount, 2)
+    save(f, b)
 
 
 def notify(text: str) -> None:
@@ -322,7 +349,8 @@ class OrbCalm:
                     continue
                 p = self.calm_score(sym, d)
                 st["calm"] = p
-                st["phase"] = "watching for a breakout" if p <= self.threshold else "sitting out: trend day predicted"
+                use_filter = self.exp.get("calm_filter", True)
+                st["phase"] = "watching for a breakout" if (p <= self.threshold or not use_filter) else "sitting out: trend day predicted"
                 events.append({"sym": sym, "text": f"{sym}: {'calm day' if p <= self.threshold else 'trend day predicted'} "
                                                    f"(score {p:.3f} vs {self.threshold:.3f})"})
                 continue
@@ -343,6 +371,10 @@ class OrbCalm:
                     if not ask or ask < 0.10:
                         st["phase"] = "done for today"; st["note"] = f"no price for {contract}"; continue
                     qty = int(self.exp["stake"] // (ask * 100))
+                    if not self.shadow:                       # all experiments share $2,500 a day
+                        qty = min(qty, int(max(0.0, budget_left(self.mk.today)) // (ask * 100)))
+                        if qty < 1:
+                            st["phase"] = "done for today"; st["note"] = f"today's ${DAILY_BUDGET:,.0f} experiment budget is used up"; continue
                     cap = BR.size_cap("proving")
                     if cap is not None:
                         qty = min(qty, cap)                   # new order code: minimum size until it has proven itself
@@ -355,6 +387,7 @@ class OrbCalm:
                     fill, qty = got
                     if not self.shadow:
                         remember_open(contract, self.exp["id"], sym)
+                        budget_spend(self.mk.today, fill * qty * 100)
                     st.update(phase="in a trade", side=side, contract=contract, qty=qty, entry=fill, atr=atr,
                               entry_u=float(d["c"][min(minute, d["seen"]) - 1]), entry_min=minute, best=0.0,
                               opened=self.mk.now().isoformat(timespec="seconds"), path=[])
@@ -499,8 +532,13 @@ def main() -> int:
             except Exception as exc:
                 log.append(f"{market.now():%H:%M} {rid}: error {type(exc).__name__}: {exc}"); print(log[-1], flush=True)
         if not args.replay:
-            hold = {st["contract"]: st["qty"] for r in runners.values() if not getattr(r, "shadow", False)
-                    for st in r.state.values() if st.get("phase") == "in a trade"}
+            hold = {}                                         # two experiments may hold the same contract: add them up
+            for r in runners.values():
+                if getattr(r, "shadow", False):
+                    continue
+                for st in r.state.values():
+                    if st.get("phase") == "in a trade":
+                        hold[st["contract"]] = hold.get(st["contract"], 0) + st["qty"]
             f = open_file()
             for c in (json.loads(f.read_text()) if f.exists() else {}):
                 hold.setdefault(c, (market.held(c) or (0,))[0])

@@ -1,16 +1,19 @@
-"""Risk guard: an independent check, every minute of the trading day, that the bots and the broker agree,
-and that no bot (or the whole account) loses more than its hard limit. It never trusts a bot's own view.
+"""Risk guard: an independent check, every minute of the trading day, that the bots and the broker agree
+and that no bot trades outside its own limits. It never trusts a bot's own view, and it only steps in when
+something is actually wrong: normal market days (even big ones) never pause anything.
 
 Every minute (9:25-16:20 New York, weekdays):
   1. Unclaimed option positions: an option held at Alpaca that no bot claims (claims: risk/claims/<bot>.json)
      for 3+ minutes -> close the position, alert, and pause ONLY the bot whose order bought it (found from the
      tag in the order id). Everything is paused only if the owner can't be identified.
   2. Ghost claims: a bot claims a position Alpaca doesn't have, for 5+ minutes -> alert.
-  3. Per-bot daily loss limit (realized today + open P&L of its positions):
-        experiments (proving ground) $1,000 · options bots $2,500 each
-     -> close that bot's positions, pause it for the rest of the day, alert.
-  4. Whole account down 3%+ on the day -> close every option position, pause everything for the day, alert.
-     (The portfolio's long-term ETFs are NOT force-sold: selling them in a dip is the wrong move.)
+  3. Per-bot daily loss beyond its whole daily budget (realized today + open P&L): options bots $5,000 each,
+     experiments $2,500 shared. A bot that only buys options can't lose more than it spends, so this only
+     fires on a malfunction -> close that bot's positions, pause only that bot for the day, alert.
+  4. Trading outside its limits: a bot that spent more than its daily budget (options bots $5,000 each,
+     experiments $2,500) or made more trades than allowed (options bots 5), per its tagged orders at
+     Alpaca -> pause only that bot for the day, alert. (No account-wide limit: the portfolio's ETFs move
+     with the market and that is never a reason to stop the trading bots.)
   5. From 10 min before the close (15:50 NY on normal days): any option still held is closed (every bot should be flat by 15:45; nothing is held overnight).
   --smoke (9:35 NY): a live round trip on Alpaca paper with 1 share of SGOV (an ETF no bot holds): buy,
      confirm by position, sell, confirm gone. Alert-only: a failure never pauses the bots.
@@ -35,11 +38,14 @@ NY = B.NY
 STATE = Path(os.environ.get("PAPER_STATE", Path.home() / "projects" / "paper-state"))
 RISK = B.RISK
 BOTS = {   # bot id -> (trade log, P&L column, daily loss limit)
-    "options-spy": (STATE / "options-spy" / "options_trades.csv", "pl_usd", float(os.environ.get("RISK_LIMIT_OPTIONS", "2500"))),
-    "options-qqq": (STATE / "options-qqq" / "options_trades.csv", "pl_usd", float(os.environ.get("RISK_LIMIT_OPTIONS", "2500"))),
-    "proving": (STATE / "proving" / "trades.csv", "pnl", float(os.environ.get("RISK_LIMIT_EXPERIMENTS", "1000"))),
+    "options-spy": (STATE / "options-spy" / "options_trades.csv", "pl_usd", float(os.environ.get("RISK_LIMIT_OPTIONS", "5000"))),
+    "options-qqq": (STATE / "options-qqq" / "options_trades.csv", "pl_usd", float(os.environ.get("RISK_LIMIT_OPTIONS", "5000"))),
+    "proving": (STATE / "proving" / "trades.csv", "pnl", float(os.environ.get("RISK_LIMIT_EXPERIMENTS", "2500"))),
 }
-ACCOUNT_LIMIT = float(os.environ.get("RISK_ACCOUNT_LIMIT_PCT", "0.03"))
+BUDGET = {"options-spy": float(os.environ.get("OPT_DAILY_BUDGET", "5000")), "options-qqq": float(os.environ.get("OPT_DAILY_BUDGET", "5000")),
+          "proving": float(os.environ.get("PROVING_DAILY_BUDGET", "2500"))}
+MAX_TRADES = {"options-spy": int(os.environ.get("OPT_MAX_TRADES", "5")), "options-qqq": int(os.environ.get("OPT_MAX_TRADES", "5"))}
+BUDGET_SLACK = 1.10                     # fills can come in a little above the price a bot sized its order at
 ORPHAN_GRACE_MIN, GHOST_GRACE_MIN = 3, 5
 SMOKE_SYMBOL = os.environ.get("RISK_SMOKE_SYMBOL", "SGOV")
 
@@ -63,6 +69,31 @@ def realized_today(path: Path, col: str, today: str) -> float:
                    if r.get("date") == today and not str(r.get("experiment", "")).endswith("-shadow"))   # shadow = no orders
     except Exception:
         return 0.0
+
+
+def today_usage(tc, now: dt.datetime) -> dict[str, dict]:
+    """Per bot: money spent on buys that filled today and how many buys, from the bot tag in each order id."""
+    out: dict[str, dict] = {}
+    try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        start = dt.datetime.combine(now.date(), dt.time(4, 0), NY)
+        orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, after=start, limit=500))
+    except Exception:
+        return out
+    for o in orders:
+        if str(getattr(o.side, "value", o.side)).lower() != "buy":
+            continue
+        qty = float(getattr(o, "filled_qty", None) or 0) if hasattr(o, "filled_qty") else (float(o.qty) if o.filled_avg_price else 0.0)
+        px = float(o.filled_avg_price or 0)
+        if qty <= 0 or px <= 0:
+            continue
+        bot = B.bot_from_order_id(getattr(o, "client_order_id", None), o.symbol)
+        if not bot:
+            continue
+        mult = 100 if len(o.symbol) > 10 else 1
+        u = out.setdefault(bot, {"spent": 0.0, "buys": 0}); u["spent"] += qty * px * mult; u["buys"] += 1
+    return out
 
 
 def claims() -> dict[str, str]:
@@ -135,19 +166,25 @@ def run(tc, now: dt.datetime) -> dict:
                  f"{bot} lost ${-pnl:,.0f} today (limit ${limit:,.0f}). Closed {', '.join(closed) or 'nothing (no open positions)'}; "
                  f"no new trades from it until tomorrow.")
             bots[bot]["paused"] = True
-    # 4. whole account
+    # 4. trading outside its own limits (budget / trade count), from the bots' tagged orders at Alpaca
     acct = tc.get_account()
     eq, last = float(acct.equity), float(acct.last_equity or acct.equity)
     dd = eq / last - 1 if last else 0.0
-    # the portfolio's long-term ETFs are kept through dips, so their daily swing doesn't count toward this limit
-    etf_today = sum(float(getattr(p, "unrealized_intraday_pl", 0) or 0) for p in positions if p.symbol not in held_opts)
-    trade_dd = ((eq - last) - etf_today) / last if last else 0.0
-    if trade_dd <= -ACCOUNT_LIMIT and not B.halted("all")[0]:
-        B.set_halt("all", f"account down {dd:.1%} today", until=today)
-        closed = [s for s in held_opts if br.sell(s) is not None]
-        once("account-limit", "Risk guard: account limit hit",
-             f"Account is down {dd:.1%} today (limit {ACCOUNT_LIMIT:.0%}). Closed all options ({', '.join(closed) or 'none'}); "
-             f"every bot paused until tomorrow. Portfolio ETFs kept.")
+    usage = today_usage(tc, now)
+    for bot, u in usage.items():
+        if bot not in bots:
+            continue
+        bots[bot].update(spent_today=round(u["spent"], 2), buys_today=u["buys"], budget=BUDGET.get(bot))
+        over_budget = bot in BUDGET and u["spent"] > BUDGET[bot] * BUDGET_SLACK
+        over_trades = bot in MAX_TRADES and u["buys"] > MAX_TRADES[bot]
+        if (over_budget or over_trades) and not B.halted(bot)[0]:
+            what = (f"spent ${u['spent']:,.0f} (budget ${BUDGET[bot]:,.0f})" if over_budget else
+                    f"made {u['buys']} buys (limit {MAX_TRADES[bot]})")
+            B.set_halt(bot, f"traded outside its limits: {what}", until=today)
+            once(f"outside-{bot}", f"Risk guard: {bot} paused (outside its limits)",
+                 f"{bot} {what} today, which it should never do. Only {bot} is paused; the other bots keep trading. "
+                 f"It keeps managing its open trades and resumes tomorrow.")
+            bots[bot]["paused"] = True
     # 5. end of day (10 min before the close, so half days work too): nothing is held overnight
     try:
         nc = getattr(tc.get_clock(), "next_close", None)
@@ -162,7 +199,7 @@ def run(tc, now: dt.datetime) -> dict:
                  f"Closed it{f' at ${px:.2f}' if px else ' (not confirmed yet, retrying every minute)'}.")
     paused_all, why_all = B.halted("all")
     out = {"updated": now.isoformat(timespec="seconds"), "ok": not state["seen"] and not paused_all,
-           "account": {"equity": round(eq, 2), "change": round(eq - last, 2), "change_pct": round(dd, 4), "limit_pct": ACCOUNT_LIMIT, "trading_change_pct": round(trade_dd, 4)},
+           "account": {"equity": round(eq, 2), "change": round(eq - last, 2), "change_pct": round(dd, 4), "limit_pct": None},
            "positions": {"options": len(held_opts), "unclaimed": sorted(state["seen"]), "claimed_by": owner},
            "bots": bots, "paused_all": paused_all, "paused_all_why": why_all, "events": events[-20:]}
     B._save(st_path, state)
