@@ -167,7 +167,30 @@ def main() -> int:
                   f"(simulator now: 1-min bars, IV x{IV_MULT}, spread {SPREAD:.0%})")
     else:
         print(verdict)
+    _use_real_bars(report)
     return 0
+
+
+def _use_real_bars(report: dict) -> None:
+    """The search prices trades with REAL option bars (Black-Scholes is only a rare fallback), so the
+    check the app shows should be the real-bar one (sim_check_real.py). The Black-Scholes numbers stay
+    in the report under "black_scholes"."""
+    try:
+        import sim_check_real as SC
+        SC.main()
+        real = json.loads(SC.OUT.read_text()).get("summary")
+    except Exception as exc:
+        print(f"real-bar check unavailable ({type(exc).__name__}: {exc}); keeping the Black-Scholes check")
+        return
+    if not real:
+        return
+    n = real["trades"]
+    report["black_scholes"] = {"current": report.get("current"), "verdict": report.get("verdict")}
+    report["current"] = {"trades": n, "entry_err_median": real["entry_err_median"], "entry_abs_err": real["entry_abs_err_median"],
+                         "ret_err_mean": real.get("ret_err_mean", 0.0)}
+    report["verdict"] = f"real option bars, {n} real trades" + ("" if n >= MIN_TRUST else f", trust it after {MIN_TRUST}")
+    report["method"] = "real option bars"
+    tmp = OUT.with_suffix(".tmp"); tmp.write_text(json.dumps(report)); tmp.replace(OUT)
 
 
 if __name__ == "__main__":
