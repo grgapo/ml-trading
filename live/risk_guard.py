@@ -139,7 +139,10 @@ def run(tc, now: dt.datetime) -> dict:
     acct = tc.get_account()
     eq, last = float(acct.equity), float(acct.last_equity or acct.equity)
     dd = eq / last - 1 if last else 0.0
-    if dd <= -ACCOUNT_LIMIT and not B.halted("all")[0]:
+    # the portfolio's long-term ETFs are kept through dips, so their daily swing doesn't count toward this limit
+    etf_today = sum(float(getattr(p, "unrealized_intraday_pl", 0) or 0) for p in positions if p.symbol not in held_opts)
+    trade_dd = ((eq - last) - etf_today) / last if last else 0.0
+    if trade_dd <= -ACCOUNT_LIMIT and not B.halted("all")[0]:
         B.set_halt("all", f"account down {dd:.1%} today", until=today)
         closed = [s for s in held_opts if br.sell(s) is not None]
         once("account-limit", "Risk guard: account limit hit",
@@ -159,7 +162,7 @@ def run(tc, now: dt.datetime) -> dict:
                  f"Closed it{f' at ${px:.2f}' if px else ' (not confirmed yet, retrying every minute)'}.")
     paused_all, why_all = B.halted("all")
     out = {"updated": now.isoformat(timespec="seconds"), "ok": not state["seen"] and not paused_all,
-           "account": {"equity": round(eq, 2), "change": round(eq - last, 2), "change_pct": round(dd, 4), "limit_pct": ACCOUNT_LIMIT},
+           "account": {"equity": round(eq, 2), "change": round(eq - last, 2), "change_pct": round(dd, 4), "limit_pct": ACCOUNT_LIMIT, "trading_change_pct": round(trade_dd, 4)},
            "positions": {"options": len(held_opts), "unclaimed": sorted(state["seen"]), "claimed_by": owner},
            "bots": bots, "paused_all": paused_all, "paused_all_why": why_all, "events": events[-20:]}
     B._save(st_path, state)
