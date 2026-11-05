@@ -10,7 +10,7 @@ import broker as B, options_bot as O
 failures = []
 def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name); failures.append(name) if not cond else None
-DAY = dt.date(2026, 11, 4)
+DAY = dt.datetime.now(B.NY).date()
 
 class Agent:
     mode, signal_mode = "test", True

@@ -62,7 +62,7 @@ check("unknown / missing order id -> no owner", B.bot_from_order_id(None, OPT) i
 
 G_fast = lambda: setattr(B.Broker, "__init__", lambda self, client, confirm_s=1, poll_s=0.02: (setattr(self, "c", client), setattr(self, "confirm_s", 0.3), setattr(self, "poll_s", 0.02)) and None)
 orig_init = B.Broker.__init__; G_fast()
-T0 = dt.datetime(2026, 11, 4, 10, 0, tzinfo=B.NY)
+T0 = dt.datetime.combine(dt.datetime.now(B.NY).date(), dt.time(10, 0), tzinfo=B.NY)
 
 # 7. a stray position bought by the proving ground (late fill after its cancel) pauses ONLY the proving ground
 fresh(); c = FakeWithAccount()
@@ -89,9 +89,9 @@ check("unknown owner: everything paused (safe default)", B.halted("all")[0] is T
 
 # 10. 3:50 sweep: an option still open (even a claimed one) is closed; nothing held overnight
 fresh(); c = FakeWithAccount(); c.hold(OPT, 1, 2.0); B.write_claims("options-spy", {OPT: 1})
-G.run(c, dt.datetime(2026, 11, 4, 15, 40, tzinfo=B.NY))
+G.run(c, dt.datetime.combine(dt.datetime.now(B.NY).date(), dt.time(15, 40), tzinfo=B.NY))
 check("a claimed option at 3:40 is left alone", c.positions[OPT][0] == 1)
-G.run(c, dt.datetime(2026, 11, 4, 15, 51, tzinfo=B.NY))
+G.run(c, dt.datetime.combine(dt.datetime.now(B.NY).date(), dt.time(15, 51), tzinfo=B.NY))
 check("at 3:51 it is closed", c.positions.get(OPT, [0])[0] == 0)
 check("...without pausing anyone", not B.halted("all")[0] and not B.halted("options-spy")[0])
 
