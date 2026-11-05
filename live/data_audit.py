@@ -66,7 +66,7 @@ def audit_symbol(sym: str) -> dict:
         r = np.diff(c) / c[:-1] if len(c) > 2 else np.array([])
         spikes = int(((np.abs(r[:-1]) >= SPIKE) & (np.sign(r[:-1]) != np.sign(r[1:])) & (np.abs(r[1:]) >= SPIKE * 0.6)).sum()) if len(r) > 2 else 0
         bad_px = int((g[["open", "high", "low", "close"]] <= 0).to_numpy().sum())
-        short = n < 380 and not (200 <= n <= 215)
+        short = n < 300 and not (200 <= n <= 215)          # quiet minutes on the free IEX feed are normal; flag real holes
         close_err = None
         if day in yc and len(c):
             close_err = round(c[-1] / yc[day] - 1, 5)
