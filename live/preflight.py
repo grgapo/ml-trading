@@ -24,8 +24,8 @@ NY = B.NY
 HERE = Path(__file__).resolve().parent
 STATE = Path(os.environ.get("PAPER_STATE", Path.home() / "projects" / "paper-state"))
 TIMERS = ["risk-guard.timer", "risk-smoke.timer", "options-bot-spy.timer", "options-bot-qqq.timer", "proving-ground.timer",
-          "portfolio-bot.timer", "data-audit.timer", "chain-recorder.timer"]
-BOT_UNITS = ["options-bot-spy.service", "options-bot-qqq.service", "proving-ground.service", "risk-guard.service"]
+          "portfolio-bot.timer", "data-audit.timer", "chain-recorder.timer", "options-bot-exp.timer"]
+BOT_UNITS = ["options-bot-spy.service", "options-bot-qqq.service", "options-bot-exp.service", "proving-ground.service", "risk-guard.service"]
 results: list[tuple[str, bool, str]] = []
 
 
@@ -87,7 +87,9 @@ def main() -> int:
     rg = (HERE / "risk_guard.py").read_text()
     check("risk guard: no account-wide limit", "ACCOUNT_LIMIT" not in rg and "trade_dd" not in rg)
     lim_o, lim_e = os.environ.get("RISK_LIMIT_OPTIONS", "5000"), os.environ.get("RISK_LIMIT_EXPERIMENTS", "2500")
-    check("risk guard limits = daily budgets ($5,000 / $2,500)", float(lim_o) >= 5000 and float(lim_e) >= 2500, f"options {lim_o}, experiments {lim_e}")
+    check("risk guard limits = daily budgets ($5,000 options / $1,250 + $1,250 experiments)", float(lim_o) >= 5000,
+          f"options {lim_o}, proving {os.environ.get('PROVING_DAILY_BUDGET', '1250')}, exp bot {os.environ.get('EXP_DAILY_BUDGET', '1250')}")
+    check("experiment bot (options-exp) has its recipe", (STATE / "options-exp" / "options_model.joblib").exists())
     check("risk guard checks bots trading outside their limits", "today_usage" in rg)
     # 4. proving ground experiments
     try:
@@ -97,7 +99,7 @@ def main() -> int:
         reg = reg if isinstance(reg, list) else reg.get("experiments", [])
         live = [e["id"] for e in reg if e.get("status") not in ("retired",)]
         check("proving ground: every-day experiment ready", "orb-daily" in ids, f"active: {', '.join(live) or '(registry builds at start)'}")
-        check("proving ground: $2,500 shared daily budget", getattr(PG, "DAILY_BUDGET", 0) >= 2500, f"${getattr(PG, 'DAILY_BUDGET', 0):,.0f}")
+        check("proving ground: its share of the experiment budget", getattr(PG, "DAILY_BUDGET", 0) >= 1250, f"${getattr(PG, 'DAILY_BUDGET', 0):,.0f}")
     except Exception as exc:
         check("proving ground loads", False, f"{type(exc).__name__}: {exc}")
     # 5. timers + last runs

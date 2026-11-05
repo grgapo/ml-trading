@@ -107,7 +107,8 @@ def notify_once(key: str, title: str, text: str, priority: str = "high") -> None
 
 
 STRIKES_TO_PAUSE = int(os.environ.get("RISK_ORDER_STRIKES", "3"))
-TAG_TO_BOT = {"pg": "proving", "proving": "proving", "options-spy": "options-spy", "options-qqq": "options-qqq"}
+TAG_TO_BOT = {"pg": "proving", "proving": "proving", "options-spy": "options-spy", "options-qqq": "options-qqq",
+              "options-exp": "options-exp"}
 
 
 def record_order(bot_id: str | None, ok: bool, detail: str = "") -> int:

@@ -40,11 +40,13 @@ RISK = B.RISK
 BOTS = {   # bot id -> (trade log, P&L column, daily loss limit)
     "options-spy": (STATE / "options-spy" / "options_trades.csv", "pl_usd", float(os.environ.get("RISK_LIMIT_OPTIONS", "5000"))),
     "options-qqq": (STATE / "options-qqq" / "options_trades.csv", "pl_usd", float(os.environ.get("RISK_LIMIT_OPTIONS", "5000"))),
-    "proving": (STATE / "proving" / "trades.csv", "pnl", float(os.environ.get("RISK_LIMIT_EXPERIMENTS", "2500"))),
+    "proving": (STATE / "proving" / "trades.csv", "pnl", float(os.environ.get("PROVING_DAILY_BUDGET", "1250"))),
+    "options-exp": (STATE / "options-exp" / "options_trades.csv", "pl_usd", float(os.environ.get("EXP_DAILY_BUDGET", "1250"))),
 }
 BUDGET = {"options-spy": float(os.environ.get("OPT_DAILY_BUDGET", "5000")), "options-qqq": float(os.environ.get("OPT_DAILY_BUDGET", "5000")),
-          "proving": float(os.environ.get("PROVING_DAILY_BUDGET", "2500"))}
-MAX_TRADES = {"options-spy": int(os.environ.get("OPT_MAX_TRADES", "5")), "options-qqq": int(os.environ.get("OPT_MAX_TRADES", "5"))}
+          "proving": float(os.environ.get("PROVING_DAILY_BUDGET", "1250")), "options-exp": float(os.environ.get("EXP_DAILY_BUDGET", "1250"))}
+MAX_TRADES = {"options-spy": int(os.environ.get("OPT_MAX_TRADES", "5")), "options-qqq": int(os.environ.get("OPT_MAX_TRADES", "5")),
+              "options-exp": int(os.environ.get("EXP_MAX_TRADES", "4"))}
 BUDGET_SLACK = 1.10                     # fills can come in a little above the price a bot sized its order at
 ORPHAN_GRACE_MIN, GHOST_GRACE_MIN = 3, 5
 SMOKE_SYMBOL = os.environ.get("RISK_SMOKE_SYMBOL", "SGOV")

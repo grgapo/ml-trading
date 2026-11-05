@@ -154,6 +154,27 @@ class Agent:
         tmp.replace(self.path)
 
 
+ATR_TRIGGER, ATR_GIVEBACK, ATR_STOP = 4.0, 0.5, 10.0   # same as options_pretrain.atr_exit_bar
+
+
+def atr_exit(t: dict, market, end_of_day: bool):
+    """The search's ATR exit on the live trade: after the underlying moves ATR_TRIGGER x ATR its way, sell when it
+    gives back ATR_GIVEBACK of the best move; safety stop ATR_STOP x ATR against; else out at the flatten time."""
+    if end_of_day:
+        return "end of day"
+    atr = t.get("atr")
+    if not atr or atr != atr:
+        return None                                    # no ATR recorded: only the end-of-day exit applies
+    u = float(market.bars(t["symbol"])["close"].iloc[-1])
+    gain = t.get("sgn", 1) * (u - t.get("u_signal", t.get("u_entry", u)))
+    t["best"] = max(float(t.get("best", 0.0)), gain)
+    if gain <= -ATR_STOP * atr:
+        return "atr stop"
+    if t["best"] >= ATR_TRIGGER * atr and gain <= (1 - ATR_GIVEBACK) * t["best"]:
+        return "atr giveback"
+    return None
+
+
 class ModelAgent:
     """Pre-trained model (live/options_pretrain.py): predicts each trade's return
     from the indicators, takes the best one if it clears MIN_EDGE, and retrains
@@ -171,7 +192,7 @@ class ModelAgent:
         self.strategy = self.bundle.get("strategy")     # set when the nightly search promoted a champion
         if self.strategy:
             self.exits = {"sl": self.strategy["stop_loss"], "tp": self.strategy["take_profit"],
-                          "hold": self.strategy["max_hold"]}
+                          "hold": self.strategy["max_hold"], "atr_mode": self.strategy.get("exit_style") == "atr"}
         self.min_edge = float(os.environ.get("OPT_MIN_EDGE", self.bundle.get("min_edge", 0.03)))
         self.seen: set = set()        # signal bars already decided on
         self.market = None            # set by run_session (daily history for the vol forecast)
@@ -304,7 +325,9 @@ class ModelAgent:
                     label += "not confident enough · "
         return {"action": a, "explored": explored, "situation": f"{symbol} · {label}" + describe(row),
                 "features": [round(x, 8) for x in f.tolist()],
-                "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in options} if preds else None}
+                "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in options} if preds else None,
+                "atr": float(row["atr5"]) if "atr5" in row and row["atr5"] == row["atr5"] else None,
+                "u_close": float(row["close"])}
 
     def learn_trade(self, trade: dict, reward: float, date: str) -> None:
         new = not self.live_path.exists()
@@ -694,10 +717,13 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                                          round(float(r.low), 2), round(float(r.close), 2)] for r in b.itertuples()][-90:]
                     except Exception:
                         pass
-                    reason = ("stop-loss" if pos["plpc"] <= ex["sl"] else
-                              "take-profit" if pos["plpc"] >= ex["tp"] else
-                              "max hold" if held >= ex["hold"] else
-                              "end of day" if now >= flatten else None)
+                    if ex.get("atr_mode"):                   # exits on the underlying, in ATR units (as the search simulates)
+                        reason = atr_exit(t, market, now >= flatten)
+                    else:
+                        reason = ("stop-loss" if ex["sl"] is not None and pos["plpc"] <= ex["sl"] else
+                                  "take-profit" if ex["tp"] is not None and pos["plpc"] >= ex["tp"] else
+                                  "max hold" if ex["hold"] is not None and held >= ex["hold"] else
+                                  "end of day" if now >= flatten else None)
                     if reason and market.close(t["contract"]) is False:
                         status(f"exit ({reason}) not confirmed yet, retrying")
                         reason = None                        # still held: keep managing it, retry next minute
@@ -777,7 +803,9 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                                                "opened": now.isoformat(timespec="seconds"), "situation": sit,
                                                "features": d["features"], "explored": explored,
                                                "plpc": 0.0, "pl_usd": 0.0, "u_entry": round(float(closes[-1]), 2),
-                                               "cost": round(qty * price * 100, 2)}
+                                               "cost": round(qty * price * 100, 2),
+                                               "atr": d.get("atr"), "u_signal": d.get("u_close", float(closes[-1])),
+                                               "sgn": 1 if kind == "call" else -1, "best": 0.0}
                             elif qty < 1:
                                 day["last_decision"]["note"] = "too expensive or no contract"
                     status("in a trade" if day["open"] else
