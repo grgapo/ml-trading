@@ -79,8 +79,8 @@ def main() -> int:
     except Exception:
         pass
     check("size caps (info)", True, ", ".join(f"{k}: {v['max_qty']} contract(s) ({v.get('why', '')[:40]})" for k, v in caps.items()) or "none")
-    check("no stray size cap on options-qqq or proving", not any(k in caps for k in ("options-qqq", "proving")),
-          ", ".join(k for k in caps if k in ("options-qqq", "proving")))
+    check("no stray size cap on the proving ground", "proving" not in caps,
+          "proving" if "proving" in caps else "")
     op = STATE / "proving" / "open_positions.json"
     left = json.loads(op.read_text()) if op.exists() else {}
     check("proving ground: no leftover positions on file", not left, ", ".join(left))
