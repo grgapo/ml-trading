@@ -29,6 +29,7 @@ from options_pretrain import DATA_DIR, NY, SPREAD  # noqa: E402
 
 OUT = Path.home() / "projects" / "paper-state" / "search" / "straddle_report.json"
 STAKE = 1000.0
+FRESH = int(os.environ.get("STRADDLE_FRESH_MIN", "0"))      # >0: both legs must have traded within this many minutes
 ENTRIES = {"9:45": 15, "10:00": 30, "10:30": 60, "11:30": 120}
 TPS, SLS, HOLDS = (0.2, 0.4, 0.6, 1.0), (-0.2, -0.3, -0.5, None), (60, 120, 240)
 FLAT = ORB.FLAT
@@ -48,9 +49,15 @@ def paths(sym: str):
         if not fp.exists():
             continue
         try:
-            ser = OH.day_series(pd.read_csv(fp))
+            raw = pd.read_csv(fp); ser = OH.day_series(raw)
         except Exception:
             continue
+        age = {}                                                # contract -> minutes since its last real trade, each minute
+        if FRESH:
+            for cname, g in raw.groupby("contract"):
+                last = np.full(390, np.nan); mm = g["minute"].to_numpy(int); ok = (mm >= 0) & (mm < 390)
+                last[mm[ok]] = mm[ok]
+                last = pd.Series(last).ffill().to_numpy(); age[cname] = np.arange(390) - last
         gap = abs(d["o"][0] / d["prev_close"] - 1)
         rec = {"date": str(d["date"]), "gap": gap, "iv_rv": iv.get(str(d["date"])), "legs": {}}
         for (label, m), (dte, expiry) in itertools.product(ENTRIES.items(), (("0dte", d["date"]), ("1dte", sessions[i + 1]))):
@@ -61,6 +68,12 @@ def paths(sym: str):
             v = c + p
             if not np.isfinite(v[m]) or v[m] < 0.2:
                 continue
+            if FRESH:                                           # only prices backed by a recent real trade on BOTH legs
+                ac, ap = age.get(OH.occ(sym, expiry, True, k)), age.get(OH.occ(sym, expiry, False, k))
+                fresh = (ac <= FRESH) & (ap <= FRESH)
+                if not fresh[m]:
+                    continue
+                v = np.where(fresh, v, np.nan)                  # a stale minute can't be used to exit either
             rec["legs"][(label, dte)] = (float(v[m] * (1 + SPREAD / 2)), v[m + 1:FLAT + 1] * (1 - SPREAD / 2))
         if rec["legs"]:
             out[rec["date"]] = rec
