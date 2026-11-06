@@ -81,7 +81,9 @@ def load_raw(months: int, symbols: list[str], synthetic: bool) -> dict:
 
 
 def cache_path(p: dict, symbols) -> Path:
-    return CACHE_DIR / "-".join(sorted(symbols)) / f"{dataset_key(p)}.npz"
+    from options_pretrain import SPREAD                       # a different cost = different practice trades = its own file
+    tag = "" if abs(SPREAD - 0.04) < 1e-9 else f"-sp{round(SPREAD * 1000)}"
+    return CACHE_DIR / "-".join(sorted(symbols)) / f"{dataset_key(p)}{tag}.npz"
 
 
 def dataset_for(p: dict, raw: dict, memo: dict) -> dict:
