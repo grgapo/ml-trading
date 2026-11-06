@@ -28,7 +28,8 @@ NY = ZoneInfo("America/New_York")
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path.home() / "projects" / "paper-state" / "portfolio"))
 DATA = Path(os.environ.get("PORTFOLIO_DATA", Path.home() / "projects" / "data" / "portfolio"))
 HOLDOUT_YEARS = 3
-MAX_DD = -0.35
+MAX_DD = float(os.environ.get("PORTFOLIO_MAX_DD", "-0.25"))
+PROPOSE = os.environ.get("PORTFOLIO_PROPOSE", "1") == "1"   # write a candidate for approval instead of switching
 STATUS = {"name": "Portfolio research", "phase": "starting", "index": 0, "total": None, "results": []}
 
 
@@ -79,13 +80,16 @@ def main() -> int:
             rate = (time.time() - t0) / k
             status(index=k, symbol=P.describe(p), seconds_left=round(rate * (len(var) - k)))
         ok = [x for x in rows if x["search"].get("cagr") is not None and x["search"]["max_dd"] >= MAX_DD]
-        top = sorted(ok, key=lambda x: -x["search"]["cagr"])[:5]
+        # ranked by return per unit of risk on the SEARCH years (raw growth favoured piling into one theme)
+        top = sorted(ok, key=lambda x: -(x["search"]["sharpe"] or 0))[:5]
         status(phase="checking the top 5 on the locked last 3 years", seconds_left=None)
         hb = {"SPY": P.benchmark(px, split, len(px), {"SPY": 1.0}), "60/40": P.benchmark(px, split, len(px), {"SPY": 0.6, "IEF": 0.4})}
         for x in top:
             x["holdout"] = P.backtest(px, x["params"], split, len(px))
-        allowed = [x for x in top if x["holdout"]["max_dd"] >= min(hb["SPY"]["max_dd"] * 1.25, -0.25)]
-        champ = max(allowed or top, key=lambda x: x["holdout"]["cagr"]) if top else None
+        # the locked years are pass/fail only (no picking the best of 5 on them): positive growth, drawdown not much
+        # worse than SPY's; the champion is the best-ranked (search years) variation that passes
+        allowed = [x for x in top if x["holdout"]["cagr"] > 0 and x["holdout"]["max_dd"] >= min(hb["SPY"]["max_dd"] * 1.25, -0.25)]
+        champ = allowed[0] if allowed else None
         weights = P.target_weights(px, champ["params"]).round(4).to_dict() if champ else {}
         result = {
             "phase": "done", "name": "Portfolio research", "updated": dt.datetime.now(NY).isoformat(timespec="seconds"),
@@ -103,8 +107,13 @@ def main() -> int:
         }
         write(STATE_DIR / "research.json", result)
         if champ:
-            write(STATE_DIR / "champion.json", {"desc": champ["desc"], "params": champ["params"], "chosen": result["updated"],
-                                                "holdout_cagr": champ["holdout"]["cagr"], "spy_holdout_cagr": hb["SPY"]["cagr"]})
+            out = {"desc": champ["desc"], "params": champ["params"], "chosen": result["updated"],
+                   "holdout_cagr": champ["holdout"]["cagr"], "spy_holdout_cagr": hb["SPY"]["cagr"],
+                   "search": {k: champ["search"][k] for k in ("cagr", "vol", "sharpe", "max_dd")},
+                   "holdout": {k: champ["holdout"][k] for k in ("cagr", "vol", "sharpe", "max_dd")}}
+            write(STATE_DIR / ("champion_candidate.json" if PROPOSE else "champion.json"), out)
+            if PROPOSE:
+                print("(proposed only: the bot keeps its current champion until you approve this one)")
             print(f"champion: {champ['desc']} · locked 3y CAGR {champ['holdout']['cagr']:+.1%} (SPY {hb['SPY']['cagr']:+.1%}) · "
                   f"max drawdown {champ['holdout']['max_dd']:.0%} (SPY {hb['SPY']['max_dd']:.0%})")
         return 0

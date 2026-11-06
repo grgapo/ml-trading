@@ -91,7 +91,20 @@ def momentum(px, p):
     mom = px[a].iloc[-22] / px[a].iloc[-p["lookback"]] - 1
     if p["trend"]:
         mom = mom[last > px[a].iloc[-200:].mean()]
-    top = mom.sort_values(ascending=False).head(p["top_k"])
+    ranked = mom.sort_values(ascending=False)
+    if p.get("corr_max"):                                   # diversified: skip near-copies of what's already chosen
+        r = px[a].pct_change().iloc[-126:]
+        picks = []
+        for s in ranked.index:
+            if p["trend"] and ranked[s] <= 0:
+                break
+            if all(abs(r[s].corr(r[t])) < p["corr_max"] for t in picks):
+                picks.append(s)
+            if len(picks) == p["top_k"]:
+                break
+        top = ranked[picks]
+    else:
+        top = ranked.head(p["top_k"])
     top = top[top > 0] if p["trend"] else top
     w = pd.Series(1 / p["top_k"], index=top.index)
     if w.sum() < 1 - 1e-9:
@@ -196,6 +209,8 @@ def variations() -> list[dict]:
     for lb, k, tr in itertools.product((126, 252), (3, 5, 8), (True, False)):
         for vt in (None, 0.12):
             out.append({"strategy": "momentum", "lookback": lb, "top_k": k, "trend": tr, "cap": 1.0, "vol_target": vt})
+            for cm in (0.7, 0.8):                               # diversified momentum
+                out.append({"strategy": "momentum", "lookback": lb, "top_k": k, "trend": tr, "cap": 1.0, "vol_target": vt, "corr_max": cm})
     out.append({"strategy": "equal weight", "lookback": 63, "cap": 1.0, "vol_target": None})
     return out
 
@@ -203,7 +218,8 @@ def variations() -> list[dict]:
 def describe(p: dict) -> str:
     bits = [p["strategy"]]
     if p["strategy"] == "momentum":
-        bits.append(f"top {p['top_k']} by {p['lookback'] // 21}-month return" + (" · trend filter" if p.get("trend") else ""))
+        bits.append(f"top {p['top_k']} by {p['lookback'] // 21}-month return" + (" · trend filter" if p.get("trend") else "")
+                    + (f" · no two alike (corr < {p['corr_max']})" if p.get("corr_max") else ""))
     elif p["strategy"] != "equal weight":
         bits.append(f"{p['lookback'] // 21}-month window · max {int(p['cap'] * 100)}% per asset")
     if p.get("vol_target"):
