@@ -101,6 +101,8 @@ def today_usage(tc, now: dt.datetime) -> dict[str, dict]:
 def claims() -> dict[str, str]:
     out = {}
     for f in (RISK / "claims").glob("*.json"):
+        if f.stem.endswith("-ibkr"):                    # IBKR bots hold positions at IBKR, not Alpaca (ibkr_guard watches those)
+            continue
         try:
             for sym, q in json.loads(f.read_text()).get("holdings", {}).items():
                 if q:

@@ -534,6 +534,50 @@ class AlpacaMarket:
             self.trading.cancel_order_by_id(o.id)
 
 
+class IBKRMarket(AlpacaMarket):
+    """Same bot, IBKR execution: data, calendar, contract choice and quotes come from Alpaca (as before); orders and
+    positions go through IB Gateway (broker_ibkr, confirm-by-position). Paper account first."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        import broker_ibkr as BI
+        self.ibb = BI.IBBroker(int(os.environ.get("OPT_IB_CLIENT", "21")), tag=BOT_ID, confirm_s=30)
+
+    def sleep(self, seconds: float) -> None:
+        try:
+            self.ibb.sleep(seconds)                     # keeps the IBKR connection serviced while waiting
+        except Exception:
+            time.sleep(seconds)
+
+    def bid(self, contract: str) -> float | None:
+        from alpaca.data.enums import OptionsFeed
+        from alpaca.data.requests import OptionLatestQuoteRequest
+        try:
+            q = self.options.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=contract, feed=OptionsFeed.INDICATIVE))[contract]
+            return float(q.bid_price) if q.bid_price else None
+        except Exception:
+            return None
+
+    def buy(self, contract: str, qty: int) -> None:
+        self.ibb.submit_buy(contract, qty)              # the loop confirms the fill by position (and cancels after 2 min)
+
+    def position(self, contract: str) -> dict | None:
+        h = self.ibb.held(contract)
+        if not h:
+            return None
+        qty, entry = h
+        b = self.bid(contract)
+        plpc = (b / entry - 1) if (b and entry) else 0.0  # no quote this minute: hold steady rather than look unfilled
+        return {"qty": qty, "entry": entry, "plpc": plpc, "pl": (b - entry) * 100 * qty if b else 0.0}
+
+    def close(self, contract: str) -> bool:
+        self.ibb.sell(contract)
+        return self.ibb.held(contract) is None
+
+    def cancel_orders(self, contract: str) -> None:
+        self.ibb.cancel_open(contract)
+
+
 class SimMarket:
     """Fake market for testing: random-walk prices, simple option pricing, fast clock."""
     simulated = True                                    # never publishes claims to the real risk guard
@@ -862,7 +906,8 @@ def main() -> int:
         agent = Agent(STATE_DIR / "options_agent.json")
         explore = EXPLORATION
     print(f"agent: {agent.mode}, exploration {explore:.0%}")
-    market = SimMarket(dt.date.fromisoformat(args.date)) if args.simulate else AlpacaMarket()
+    market = (SimMarket(dt.date.fromisoformat(args.date)) if args.simulate else
+              IBKRMarket() if os.environ.get("OPT_BROKER", "alpaca") == "ibkr" else AlpacaMarket())
     try:
         run_session(market, agent, explore)
     except Exception as exc:

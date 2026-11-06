@@ -24,7 +24,8 @@ NY = B.NY
 HERE = Path(__file__).resolve().parent
 STATE = Path(os.environ.get("PAPER_STATE", Path.home() / "projects" / "paper-state"))
 TIMERS = ["risk-guard.timer", "risk-smoke.timer", "options-bot-spy.timer", "options-bot-qqq.timer", "proving-ground.timer",
-          "portfolio-bot.timer", "data-audit.timer", "chain-recorder.timer", "options-bot-exp.timer"]
+          "portfolio-bot.timer", "data-audit.timer", "chain-recorder.timer", "options-bot-exp.timer",
+          "options-bot-qqq-ibkr.timer", "ibkr-guard.timer"]
 BOT_UNITS = ["options-bot-spy.service", "options-bot-qqq.service", "options-bot-exp.service", "proving-ground.service", "risk-guard.service"]
 results: list[tuple[str, bool, str]] = []
 
@@ -115,6 +116,9 @@ def main() -> int:
         p = subprocess.run([sys.executable, str(HERE / "tests" / f"{t}.py")], capture_output=True, text=True, env=env, timeout=600)
         fails = [ln for ln in p.stdout.splitlines() if ln.startswith("FAIL")]
         check(f"tests: {t}", p.returncode == 0, "; ".join(fails[:3]))
+    # IBKR: gateway logged in, nothing left open
+    r = subprocess.run([sys.executable, str(HERE / "ibkr_guard.py"), "--check"], capture_output=True, text=True, timeout=90)
+    check("IB Gateway logged in (IBKR paper)", r.returncode == 0, (r.stdout or r.stderr).strip()[-80:])
     # 7. machine
     free = shutil.disk_usage(Path.home()).free / 1e9
     check("disk space", free > 5, f"{free:.0f} GB free")
