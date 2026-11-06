@@ -59,6 +59,12 @@ DEFAULT_EXPERIMENTS = [{
     "description": "Same opening-range breakout + noise band + VWAP, traded every day (no calm-day filter), SPY, QQQ and IWM.",
     "symbols": ["SPY", "QQQ", "IWM"], "stake": 1250, "status": "incubating", "started": None,
     "expectation": None,
+}, {
+    "id": "straddle-iwm-shadow", "impl": "straddle", "mode": "shadow", "name": "IWM straddle · 9:45 (shadow: no orders)",
+    "description": "Buy an at-the-money IWM call and put (same-day expiry) at 9:45; sell both at +60% or after 4 hours. "
+                   "Backtest on real option prices: profitable on unseen days even at a 5% cost.",
+    "symbols": ["IWM"], "stake": 300, "status": "incubating", "started": None, "expectation": None,
+    "params": {"entry_minute": 15, "tp": 0.6, "hold": 240},
 }]
 MIN_TRADES, MIN_WEEKS, MAX_LOSS = 30, 8, 5000.0      # experiments are retired at -$5,000 lifetime
 EXPERIMENT_STAKE_CAP = 2000.0                            # hard cap per trade for any experiment
@@ -435,7 +441,98 @@ class OrbCalm:
                 for s, st in self.state.items()} | {"_threshold": self.threshold}
 
 
-IMPLEMENTATIONS = {OrbCalm.ID: OrbCalm}
+class Straddle:
+    """Buy an at-the-money call AND put together (same-day expiry) at a fixed time; profit from a big move either way.
+    Exit when the pair is worth +TP over what it cost, after HOLD minutes, or at 3:45. Shadow mode records exactly what it
+    would do at live quotes with no orders. Live mode keeps both legs in sync: if the second leg doesn't fill, the first is
+    sold immediately; a leg that won't sell is retried every minute (and the risk guard closes anything left at 3:50)."""
+    ID = "straddle"
+
+    def __init__(self, exp: dict, market):
+        self.exp, self.mk = exp, market
+        self.shadow = exp.get("mode") == "shadow"
+        p = exp.get("params", {})
+        self.entry_min, self.tp, self.hold = int(p.get("entry_minute", 15)), float(p.get("tp", 0.6)), int(p.get("hold", 240))
+        self.state = {s: {"phase": f"waiting for {(570 + self.entry_min) // 60}:{(570 + self.entry_min) % 60:02d}"} for s in exp["symbols"]}
+
+    def _quote(self, c, side):
+        try:
+            return self.mk.option_price(c, side)
+        except Exception:
+            return None
+
+    def step(self, minute: int) -> list[dict]:
+        events = []
+        for sym, st in self.state.items():
+            if st["phase"].startswith("waiting") and minute >= self.entry_min:
+                if minute > self.entry_min + 15:
+                    st.update(phase="done for today", note="missed the entry window"); continue
+                bars = self.mk.bars(sym)
+                if bars is None or bars.empty:
+                    st["note"] = "no price yet"; continue
+                spot = float(bars["close"].iloc[-1]); k = round(spot); day = self.mk.today
+                call, put = OH.occ(sym, day, True, k), OH.occ(sym, day, False, k)
+                ac, ap = self._quote(call, "buy"), self._quote(put, "buy")
+                if not ac or not ap:
+                    st.update(phase="done for today", note=f"no same-day {sym} options at {k} today"); continue
+                cost = ac + ap
+                if self.shadow:
+                    fills = (ac, ap)
+                else:
+                    if budget_left(day) < cost * 100:
+                        st.update(phase="done for today", note="today's experiment budget is used up"); continue
+                    gc = self.mk.buy(call, 1)
+                    if not gc:
+                        st.update(phase="done for today", note="call leg didn't fill; nothing bought"); continue
+                    remember_open(call, self.exp["id"], sym)
+                    gp = self.mk.buy(put, 1)
+                    if not gp:
+                        px = self.mk.sell(call, 1); forget_open(call) if not self.mk.held(call) else None
+                        st.update(phase="done for today", note=f"put leg didn't fill; call sold back at {px}"); continue
+                    remember_open(put, self.exp["id"], sym)
+                    fills = (gc[0], gp[0]); budget_spend(day, (fills[0] + fills[1]) * 100)
+                st.update(phase="in a trade", contract=call, contracts=[call, put], qty=1, entry=round(fills[0] + fills[1], 4),
+                          legs={"call": fills[0], "put": fills[1]}, strike=k, entry_u=spot, entry_minute=minute,
+                          opened=self.mk.now().isoformat(timespec="seconds"), sold={}, side="straddle")
+                events.append({"sym": sym, "text": f"{sym}: {'(shadow) ' if self.shadow else ''}bought the {k} straddle for ${st['entry']:.2f}"})
+            elif st["phase"] == "in a trade":
+                bc, bp = self._quote(st["contracts"][0], "sell"), self._quote(st["contracts"][1], "sell")
+                if bc is None or bp is None:
+                    continue
+                r = (bc + bp) / st["entry"] - 1; st["now"] = round(r, 4)
+                why = ("target +%d%%" % round(self.tp * 100) if r >= self.tp else
+                       f"{self.hold // 60}h hold" if minute - st["entry_minute"] >= self.hold else
+                       "3:45 exit" if minute >= ORB.FLAT else None)
+                if not why:
+                    continue
+                if self.shadow:
+                    exit_px = bc + bp
+                else:
+                    for leg, c in (("call", st["contracts"][0]), ("put", st["contracts"][1])):
+                        if leg in st["sold"]:
+                            continue
+                        px = self.mk.sell(c, 1)
+                        if px is None and self.mk.held(c):
+                            continue                          # retried next minute
+                        st["sold"][leg] = px if px is not None else (bc if leg == "call" else bp)
+                        forget_open(c)
+                    if len(st["sold"]) < 2:
+                        st["note"] = "a leg's sell isn't confirmed yet; retrying next minute"; continue
+                    exit_px = st["sold"]["call"] + st["sold"]["put"]
+                pnl = round(100 * (exit_px - st["entry"]), 2)
+                log_trade({"date": str(self.mk.today), "experiment": self.exp["id"], "symbol": sym, "side": "straddle",
+                           "contract": "+".join(st["contracts"]), "qty": 1, "entry_time": st["opened"], "entry_price": st["entry"],
+                           "exit_time": self.mk.now().isoformat(timespec="seconds"), "exit_price": round(exit_px, 4), "pnl": pnl,
+                           "pct": round(exit_px / st["entry"] - 1, 4), "exit_reason": why, "calm_score": "", "calm_threshold": ""})
+                st.update(phase="done for today", last=f"{why}: {'+' if pnl >= 0 else '-'}${abs(pnl):,.0f}")
+                events.append({"sym": sym, "text": f"{sym}: {'(shadow) ' if self.shadow else ''}sold the straddle ({why}) for {'+' if pnl >= 0 else '-'}${abs(pnl):,.0f}"})
+        return events
+
+    def snapshot(self) -> dict:
+        return {s: dict(st) for s, st in self.state.items()}
+
+
+IMPLEMENTATIONS = {OrbCalm.ID: OrbCalm, Straddle.ID: Straddle}
 
 
 # ---- lifecycle -----------------------------------------------------------------------------------------------
@@ -538,7 +635,9 @@ def main() -> int:
                     continue
                 for st in r.state.values():
                     if st.get("phase") == "in a trade":
-                        hold[st["contract"]] = hold.get(st["contract"], 0) + st["qty"]
+                        for c in st.get("contracts") or [st["contract"]]:
+                            if c not in (st.get("sold") or {}).values():
+                                hold[c] = hold.get(c, 0) + st["qty"]
             f = open_file()
             for c in (json.loads(f.read_text()) if f.exists() else {}):
                 hold.setdefault(c, (market.held(c) or (0,))[0])
