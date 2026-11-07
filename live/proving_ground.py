@@ -65,6 +65,12 @@ DEFAULT_EXPERIMENTS = [{
                    "Backtest on real option prices: profitable on unseen days even at a 5% cost.",
     "symbols": ["IWM"], "stake": 300, "status": "incubating", "started": None, "expectation": None,
     "params": {"entry_minute": 15, "tp": 0.6, "hold": 240},
+}, {
+    "id": "orb-spy-v2", "impl": "orb-calm", "calm_filter": False, "name": "Opening range v2 · SPY (deep-search winner)",
+    "description": "Deep walk-forward winner: band 0.5, entries until 12:00, profit trigger 4 ATR, give back half, stop 10 ATR, "
+                   "same-day expiry, $2 in the money, skip big-gap days. Unseen days: +$128/trade, all neighbouring settings profitable.",
+    "symbols": ["SPY"], "stake": 1000, "status": "incubating", "started": None, "expectation": None,
+    "params": {"band": 0.5, "trigger": 4.0, "giveback": 0.5, "stop": 10.0, "expiry": "0dte", "last_entry": 150, "skip_gap": 0.004},
 }]
 MIN_TRADES, MIN_WEEKS, MAX_LOSS = 30, 8, 5000.0      # experiments are retired at -$5,000 lifetime
 EXPERIMENT_STAKE_CAP = 2000.0                            # hard cap per trade for any experiment
@@ -320,6 +326,11 @@ class OrbCalm:
         self.hist = {s: [d for d in ORB.load_days(s) if d["date"] < market.today] for s in exp["symbols"]}
         self.state = {s: {"phase": "waiting for 10:00"} for s in exp["symbols"]}
         self.shadow = exp.get("mode") == "shadow"            # live decisions + live quotes, NEVER an order
+        pr = exp.get("params") or {}                          # optional per-experiment settings (from the deep search)
+        self.BAND = float(pr.get("band", self.BAND)); self.TRIGGER = float(pr.get("trigger", self.TRIGGER))
+        self.GIVEBACK = float(pr.get("giveback", self.GIVEBACK)); self.STOP = float(pr.get("stop", self.STOP))
+        self.expiry = pr.get("expiry", "1dte"); self.last_entry = int(pr.get("last_entry", 10_000))
+        self.skip_gap = float(pr.get("skip_gap", 0) or 0)
         self.model, self.threshold = self._train()
 
     def _train(self):
@@ -344,7 +355,7 @@ class OrbCalm:
     def step(self, minute: int) -> list[dict]:
         events = []
         for sym, st in self.state.items():
-            if st["phase"] in ("done for today", "sitting out: trend day predicted", "no signal today"):
+            if st["phase"] in ("done for today", "sitting out: trend day predicted", "no signal today", "sitting out: big opening gap"):
                 continue
             bars = self.mk.bars(sym)
             d = today_dict(self.hist[sym], bars, self.mk.today)
@@ -357,6 +368,8 @@ class OrbCalm:
                 st["calm"] = p
                 use_filter = self.exp.get("calm_filter", True)
                 st["phase"] = "watching for a breakout" if (p <= self.threshold or not use_filter) else "sitting out: trend day predicted"
+                if self.skip_gap and abs(d["o"][0] / d["prev_close"] - 1) > self.skip_gap:
+                    st["phase"] = "sitting out: big opening gap"
                 events.append({"sym": sym, "text": f"{sym}: {'calm day' if p <= self.threshold else 'trend day predicted'} "
                                                    f"(score {p:.3f} vs {self.threshold:.3f})"})
                 continue
@@ -365,14 +378,17 @@ class OrbCalm:
                 if paused:
                     st["note"] = why; continue                # no new entries; exits are never blocked
                 st.pop("note", None)
-                if minute > max(ORB.CHECKS) + 2:
+                if minute > min(max(ORB.CHECKS), self.last_entry) + 2:
                     st["phase"] = "no signal today"; continue
                 sg = ORB.signal(d, self.BAND)
+                if sg and sg[0] > self.last_entry:
+                    sg = None
                 if sg and minute - sg[0] <= 2:                 # act only on a fresh check
                     m, side, atr = sg
                     spot = d["c"][m - 1]
                     strike = round(spot - 2) if side == "call" else round(spot + 2)
-                    contract = OH.occ(sym, self.mk.next_session(), side == "call", strike)
+                    expiry = self.mk.today if self.expiry == "0dte" else self.mk.next_session()
+                    contract = OH.occ(sym, expiry, side == "call", strike)
                     ask = self.mk.option_price(contract, "buy")
                     if not ask or ask < 0.10:
                         st["phase"] = "done for today"; st["note"] = f"no price for {contract}"; continue
