@@ -154,6 +154,13 @@ class Agent:
         tmp.replace(self.path)
 
 
+def strike_target(spot: float, kind: str, strategy: dict | None) -> float:
+    """The strike the search priced: at the money, or "itm2" = $2 in the money (calls below, puts above the price)."""
+    if (strategy or {}).get("moneyness") == "itm2":
+        return round(spot) - 2 if kind == "call" else round(spot) + 2
+    return spot
+
+
 ATR_TRIGGER, ATR_GIVEBACK, ATR_STOP = 4.0, 0.5, 10.0   # same as options_pretrain.atr_exit_bar
 
 
@@ -827,7 +834,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                                                 "action": action, "explored": explored, "preds": d["preds"]}
                         if action != "skip":
                             kind, dte = action.split("_")
-                            contract = market.pick_contract(symbol, kind, expiry[dte], closes[-1])
+                            target = strike_target(closes[-1], kind, getattr(agent, "strategy", None))
+                            contract = market.pick_contract(symbol, kind, expiry[dte], target)
                             price = market.ask(contract) if contract else None
                             qty = int(min(PER_TRADE, room) // (price * 100)) if price else 0
                             cap = BR.size_cap(BOT_ID) if live else None
