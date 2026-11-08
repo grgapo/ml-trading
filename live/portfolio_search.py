@@ -81,7 +81,9 @@ def main() -> int:
             status(index=k, symbol=P.describe(p), seconds_left=round(rate * (len(var) - k)))
         ok = [x for x in rows if x["search"].get("cagr") is not None and x["search"]["max_dd"] >= MAX_DD]
         # ranked by return per unit of risk on the SEARCH years (raw growth favoured piling into one theme)
-        top = sorted(ok, key=lambda x: -(x["search"]["sharpe"] or 0))[:5]
+        spy_sharpe = bench["SPY"].get("sharpe") or 0                  # well-behaved = at least SPY's return per risk
+        good = [x for x in ok if (x["search"]["sharpe"] or 0) >= spy_sharpe] or ok
+        top = sorted(good, key=lambda x: -x["search"]["cagr"])[:5]     # then the most growth among those
         status(phase="checking the top 5 on the locked last 3 years", seconds_left=None)
         hb = {"SPY": P.benchmark(px, split, len(px), {"SPY": 1.0}), "60/40": P.benchmark(px, split, len(px), {"SPY": 0.6, "IEF": 0.4})}
         for x in top:
