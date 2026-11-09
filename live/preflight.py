@@ -119,6 +119,12 @@ def main() -> int:
     # IBKR: gateway logged in, nothing left open
     r = subprocess.run([sys.executable, str(HERE / "ibkr_guard.py"), "--check"], capture_output=True, text=True, timeout=90)
     check("IB Gateway logged in (IBKR paper)", r.returncode == 0, (r.stdout or r.stderr).strip()[-80:])
+    # the app's data feed (paper-state-http on 192.168.0.162:8095)
+    try:
+        code = urllib.request.urlopen("http://192.168.0.162:8095/", timeout=5).status
+    except Exception as exc:
+        code = f"{type(exc).__name__}"
+    check("app data feed from lab03 (port 8095)", code == 200, str(code))
     # 7. machine
     free = shutil.disk_usage(Path.home()).free / 1e9
     check("disk space", free > 5, f"{free:.0f} GB free")
