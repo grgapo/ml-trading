@@ -244,15 +244,24 @@ MIN_EDGE_PER_TRADE = float(os.environ.get("OPT_MIN_EDGE_PER_TRADE", "10"))     #
 MIN_T = float(os.environ.get("OPT_MIN_T", "2.0"))                               # profit > 2x its noise
 
 
-def convincing(h: dict) -> tuple[bool, str]:
+def required_t(looks: int) -> float:
+    """The noise bar grows with how many times the locked test period has been looked at (each look is another chance
+    for luck to pass): the 5% bar split across all looks so far (Bonferroni), never below MIN_T."""
+    from statistics import NormalDist
+    k = max(1, int(looks or 1))
+    return max(MIN_T, NormalDist().inv_cdf(1 - 0.05 / k))
+
+
+def convincing(h: dict, looks: int = 1) -> tuple[bool, str]:
     n, mean, t = h.get("trades", 0), h.get("mean"), h.get("t")
+    need = required_t(looks)
     if n < MIN_HOLDOUT_TRADES:
         return False, f"only {n} trades (needs {MIN_HOLDOUT_TRADES}+)"
     if mean is None or mean < MIN_EDGE_PER_TRADE:
         return False, f"avg {mean if mean is not None else 0:+.2f}/trade (needs +{MIN_EDGE_PER_TRADE:.0f}+)"
-    if t is None or t < MIN_T:
-        return False, f"profit is {t if t is not None else 0:.1f}x its noise (needs {MIN_T:.1f}x+)"
-    return True, f"avg {mean:+.2f}/trade over {n} trades, {t:.1f}x its noise"
+    if t is None or t < need:
+        return False, f"profit is {t if t is not None else 0:.1f}x its noise (needs {need:.1f}x+ after {looks} looks at the locked period)"
+    return True, f"avg {mean:+.2f}/trade over {n} trades, {t:.1f}x its noise (bar {need:.1f}x after {looks} looks)"
 
 
 def periods(data: dict):
@@ -560,7 +569,7 @@ def main() -> int:
             best["holdout"] = run_folds(data, best["params"], folds, keep_trades=True)
             best["holdout_period"] = [h0, h1]
             champion["holdout_checks"] = champion.get("holdout_checks", 0) + 1
-            ok_bar, why = convincing(best["holdout"])
+            ok_bar, why = convincing(best["holdout"], champion["holdout_checks"])
             best["holdout"]["verdict"] = ("passed: " if ok_bar else "not convincing: ") + why
             save_json(LEADERBOARD, board)
             # a champion promoted under the old, looser bar doesn't block a convincing newcomer
