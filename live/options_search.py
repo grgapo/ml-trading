@@ -31,6 +31,7 @@ from features import FEATURES, SIGNALS, add_indicators, attach_daily_vol, daily_
 from options_pretrain import (DAILY_BUDGET, DATA_DIR, EMBARGO_DAYS, MODEL_PATH, NY, STATE_DIR,  # noqa: E402
                               build_dataset, download_month, fit_models, month_list, predict,
                               synthetic_bars, trade_month)
+import board_tools as BT  # noqa: E402
 from strategy import SIGNAL_SETS, SPACE, VOL_SPLIT, WINDOWS, allowed_actions, dataset_key, describe, needs_live_support  # noqa: E402
 
 SEARCH_DIR = STATE_DIR / "search"
@@ -472,6 +473,7 @@ def main() -> int:
     champion = load_json(CHAMPION, {"params": None, "desc": "none yet (bot keeps its current model)",
                                     "search_pnl": 0.0, "holdout_pnl": 0.0, "holdout_checks": 0})
     tried = {key_of(e["params"]) for e in board}
+    _written = BT.load_tried(SEARCH_DIR); tried |= _written          # every variation ever tested, even trimmed ones
     rng = random.Random(time.time())
     started = now.isoformat(timespec="seconds")
     tonight = 0
@@ -521,10 +523,10 @@ def main() -> int:
                           "tested": dt.datetime.now(NY).isoformat(timespec="seconds")})
             tonight += 1
             if time.time() - last_save >= 60:
-                save_json(LEADERBOARD, board)
+                _written = BT.write_all(SEARCH_DIR, board, _written)
                 save_json(SEARCH_DIR / "recent_trades.json", {"variation": describe(p), "trades": RECENT_TRADES[-300:]})
                 last_save = time.time()
-        save_json(LEADERBOARD, board)                       # everything explored tonight, before the robustness pass
+        _written = BT.write_all(SEARCH_DIR, board, _written)                       # everything explored tonight, before the robustness pass
         save_json(SEARCH_DIR / "recent_trades.json", {"variation": board[-1]["desc"] if board else "", "trades": RECENT_TRADES[-300:]})
 
         # Robustness pass: re-test the top candidates' close neighbours (one setting nudged at a time).
@@ -554,7 +556,7 @@ def main() -> int:
                 arr = np.array(results)
                 cand["robust"] = {"neighbors": len(arr), "profitable_share": round(float((arr > 0).mean()), 3),
                                   "median_pnl": round(float(np.median(arr)), 2), "worst_pnl": round(float(arr.min()), 2)}
-            save_json(LEADERBOARD, board)
+            _written = BT.write_all(SEARCH_DIR, board, _written)
 
         # One holdout look per night: the best candidate whose neighbours are mostly profitable too
         # (ranked by the median neighbour, a conservative read of its edge).
@@ -571,7 +573,7 @@ def main() -> int:
             champion["holdout_checks"] = champion.get("holdout_checks", 0) + 1
             ok_bar, why = convincing(best["holdout"], champion["holdout_checks"])
             best["holdout"]["verdict"] = ("passed: " if ok_bar else "not convincing: ") + why
-            save_json(LEADERBOARD, board)
+            _written = BT.write_all(SEARCH_DIR, board, _written)
             # a champion promoted under the old, looser bar doesn't block a convincing newcomer
             to_beat = (champion.get("holdout_pnl") or 0.0) if champion.get("holdout_t") is not None else 0.0
             if ok_bar and best["holdout"]["pnl"] > max(0.0, to_beat):
