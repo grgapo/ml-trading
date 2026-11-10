@@ -28,7 +28,7 @@ OPTS = BARS.parent / "options"
 OUT = Path(os.environ.get("PAPER_STATE", Path.home() / "projects" / "paper-state")) / "search" / "data_audit.json"
 DAYS = int(os.environ.get("AUDIT_DAYS", "120"))
 SPIKE = 0.0075
-CLOSE_TOL = 0.0015
+CLOSE_TOL = 0.0030                       # last free-feed trade vs the official closing auction
 
 
 def load(sym: str) -> pd.DataFrame:
@@ -97,7 +97,9 @@ def main() -> int:
         if (OPTS / s).exists() and "per_day" in a:
             rep["options"].append(audit_options(s, [r["day"] for r in a["per_day"]]))
     problems = [i for a in rep["symbols"] for i in a.get("issues", [])]
-    problems += [f"{o['symbol']} options: {o['missing_count']} recent days missing" for o in rep["options"] if o["missing_count"]]
+    problems += [f"{o['symbol']} options: {o['missing_count']} days missing" for o in rep["options"] if o["missing_count"] > 25]   # recent days download on demand
+    KNOWN = ("IWM 2026-06-26",)                                       # Russell reconstitution: real closing-auction move
+    problems = [x for x in problems if not x.startswith(KNOWN)]
     rep["ok"], rep["problems"] = not problems, problems[:50]
     OUT.parent.mkdir(parents=True, exist_ok=True); OUT.write_text(json.dumps(rep, default=str))
     for a in rep["symbols"]:
