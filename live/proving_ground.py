@@ -133,9 +133,10 @@ def open_file() -> Path:
     return STATE / "open_positions.json"
 
 
-def remember_open(contract: str, exp_id: str, sym: str, log: bool = True) -> None:
+def remember_open(contract: str, exp_id: str, sym: str, log: bool = True, **extra) -> None:
+    """What we hold, with enough detail (entry, qty, side) to record the trade even if we lose track of it."""
     f = open_file(); d = json.loads(f.read_text()) if f.exists() else {}
-    d[contract] = {"experiment": exp_id, "symbol": sym, "since": dt.datetime.now(NY).isoformat(timespec="seconds"), "log": log}
+    d[contract] = {"experiment": exp_id, "symbol": sym, "since": dt.datetime.now(NY).isoformat(timespec="seconds"), "log": log, **extra}
     save(f, d)
 
 
@@ -145,19 +146,74 @@ def forget_open(contract: str) -> None:
         save(f, d)
 
 
-def close_leftovers(market, log: list[str], when: str) -> None:
-    """Anything the proving ground still holds that it shouldn't (carried over from an earlier day, or not
-    closed by 3:45): close it and tell Greg."""
+def broker_exit(market, contract: str):
+    """The broker's last filled sell of this contract today: (price, time) or (None, None)."""
+    try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        start = dt.datetime.combine(market.today, dt.time(4, 0), NY)
+        orders = market.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[contract], after=start, limit=50))
+        sells = [o for o in orders if "sell" in str(o.side).lower() and o.filled_avg_price]
+        if sells:
+            o = max(sells, key=lambda o: o.filled_at or o.submitted_at)
+            return float(o.filled_avg_price), (o.filled_at or o.submitted_at)
+    except Exception:
+        pass
+    return None, None
+
+
+def record_outside_close(market, contract: str, info: dict, px, why: str, log: list[str]) -> None:
+    """Write the trade for a position that was closed without us (risk guard, broker, restart) so the books match."""
+    entry, qty = info.get("entry"), int(info.get("qty") or 1)
+    pnl = round(qty * 100 * (px - entry), 2) if (px is not None and entry) else ""
+    log_trade({"date": str(market.today), "experiment": info.get("experiment", "?"), "symbol": info.get("symbol", ""),
+               "side": info.get("side", ""), "contract": contract, "qty": qty, "entry_time": info.get("since", ""),
+               "entry_price": entry if entry is not None else "", "exit_time": market.now().isoformat(timespec="seconds"),
+               "exit_price": px if px is not None else "", "pnl": pnl,
+               "pct": round(px / entry - 1, 4) if (px is not None and entry) else "", "exit_reason": why, "calm_score": "", "calm_threshold": ""})
+    forget_open(contract)
+    money = f" for {'+' if pnl >= 0 else '-'}${abs(pnl):,.0f}" if pnl != "" else ""
+    msg = f"{contract} ({info.get('experiment', '?')}) was {why}{money}; recorded"
+    log.append(f"{market.now():%H:%M} {msg}"); print(log[-1], flush=True); notify(f"Proving ground: {msg}")
+
+
+def settle_outside(market, runners: dict, contract: str, info: dict, why: str, log: list[str]) -> None:
+    """A contract we think we hold is gone at the broker. If an experiment is still managing it, hand it the
+    broker's fill (a straddle leg just counts as sold); otherwise record the trade from what we remembered."""
+    px, _ = broker_exit(market, contract)
+    for r in runners.values():
+        for sym, st in getattr(r, "state", {}).items():
+            if st.get("phase") != "in a trade":
+                continue
+            legs = st.get("contracts") or [st.get("contract")]
+            if contract not in legs:
+                continue
+            if st.get("contracts"):                                    # straddle: let it finish with this leg's price
+                leg = "call" if contract == legs[0] else "put"
+                st.setdefault("sold", {})[leg] = px if px is not None else 0.0
+                st["note"] = f"{leg} leg was {why}"
+                forget_open(contract); log.append(f"{market.now():%H:%M} {sym}: {leg} leg was {why}"); return
+            record_outside_close(market, contract, {**info, "entry": st.get("entry", info.get("entry")), "qty": st.get("qty", info.get("qty")),
+                                                    "side": st.get("side", info.get("side")), "since": st.get("opened", info.get("since"))}, px, why, log)
+            st.update(phase="done for today", last=f"{why}")
+            return
+    if info.get("entry") is not None or px is not None:
+        record_outside_close(market, contract, info, px, why, log)
+    else:
+        forget_open(contract); log.append(f"{market.now():%H:%M} {contract} is no longer held ({why}); no price to record")
+
+
+def close_leftovers(market, log: list[str], when: str, runners: dict | None = None) -> None:
+    """Anything the proving ground still holds that it shouldn't (carried over from an earlier day, left after a
+    restart, or not closed by 3:45): close it, RECORD it, and tell Greg. Gone already: record the broker's fill."""
     f = open_file(); d = json.loads(f.read_text()) if f.exists() else {}
     for contract, info in list(d.items()):
         h = market.held(contract) if hasattr(market, "held") else None
         if not h:
-            forget_open(contract); continue
+            settle_outside(market, runners or {}, contract, info, f"closed outside the proving ground ({when})", log); continue
         px = market.sell(contract, int(h[0]))
         if px is not None:
-            forget_open(contract)
-            msg = f"closed leftover {contract} ({int(h[0])}x, bought at ${h[1]:.2f}) at ${px:.2f} {when}"
-            log.append(f"{market.now():%H:%M} {msg}"); notify(f"Proving ground {msg}")
+            record_outside_close(market, contract, {**info, "entry": info.get("entry", h[1]), "qty": int(h[0])}, px, f"leftover closed {when}", log)
 
 
 def read_trades() -> list[dict]:
@@ -408,7 +464,7 @@ class OrbCalm:
                         st["phase"] = "done for today"; st["note"] = "buy didn't fill (no position at the broker)"; continue
                     fill, qty = got
                     if not self.shadow:
-                        remember_open(contract, self.exp["id"], sym)
+                        remember_open(contract, self.exp["id"], sym, entry=fill, qty=qty, side=side)
                         budget_spend(self.mk.today, fill * qty * 100)
                     st.update(phase="in a trade", side=side, contract=contract, qty=qty, entry=fill, atr=atr,
                               entry_u=float(d["c"][min(minute, d["seen"]) - 1]), entry_min=minute, best=0.0,
@@ -500,12 +556,12 @@ class Straddle:
                     gc = self.mk.buy(call, 1)
                     if not gc:
                         st.update(phase="done for today", note="call leg didn't fill; nothing bought"); continue
-                    remember_open(call, self.exp["id"], sym)
+                    remember_open(call, self.exp["id"], sym, entry=gc[0], qty=1, side="call")
                     gp = self.mk.buy(put, 1)
                     if not gp:
                         px = self.mk.sell(call, 1); forget_open(call) if not self.mk.held(call) else None
                         st.update(phase="done for today", note=f"put leg didn't fill; call sold back at {px}"); continue
-                    remember_open(put, self.exp["id"], sym)
+                    remember_open(put, self.exp["id"], sym, entry=gp[0], qty=1, side="put")
                     fills = (gc[0], gp[0]); budget_spend(day, (fills[0] + fills[1]) * 100)
                 st.update(phase="in a trade", contract=call, contracts=[call, put], qty=1, entry=round(fills[0] + fills[1], 4),
                           legs={"call": fills[0], "put": fills[1]}, strike=k, entry_u=spot, entry_minute=minute,
@@ -602,11 +658,36 @@ def write_status(reg, runners, phase, log, market):
     })
 
 
+BEAT = {"t": time.monotonic()}
+
+
+def watchdog(limit: int = 360) -> None:
+    """If the main loop stops making progress (e.g. a network call that never returns), exit so systemd restarts us.
+    On restart, whatever we held is closed and recorded (close_leftovers), so the books always match the broker."""
+    import threading
+
+    def run():
+        while True:
+            time.sleep(30)
+            if time.monotonic() - BEAT["t"] > limit:
+                print(f"no progress for {limit // 60} min: restarting the proving ground", flush=True)
+                try:
+                    notify("Proving ground froze (no progress for 6 min) and is restarting; anything it held is closed and recorded.")
+                except Exception:
+                    pass
+                os._exit(75)
+    threading.Thread(target=run, daemon=True).start()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(); ap.add_argument("--replay", help="YYYY-MM-DD: replay a past day on stored prices")
     ap.add_argument("--record", action="store_true",
                     help="with --replay: write the replayed trades into the REAL record (to rebuild a mishandled day)")
     args = ap.parse_args()
+    if not args.replay:
+        import socket
+        socket.setdefaulttimeout(30)                          # no network call may hang forever (Nov 12 freeze)
+        watchdog()
     market = ReplayMarket(dt.date.fromisoformat(args.replay)) if args.replay else LiveMarket()
     global STATE, TRADES, REGISTRY
     if args.replay and not args.record:                       # replays never touch the real records (unless --record)
@@ -627,14 +708,18 @@ def main() -> int:
             except Exception as exc:
                 log.append(f"{e['name']}: couldn't start ({type(exc).__name__}: {exc})")
     if not args.replay:                                       # wait for the open
+        restarted = market.now().time() > dt.time(9, 40)
         while market.now().time() < dt.time(9, 31):
+            BEAT["t"] = time.monotonic()
             write_status(reg, runners, "waiting for the open", log, market); time.sleep(20)
         f = open_file()
         BR.write_claims("proving", {c: (market.held(c) or (0,))[0] for c in (json.loads(f.read_text()) if f.exists() else {})})
-        close_leftovers(market, log, "at the open (held overnight)")
+        close_leftovers(market, log, "after a restart" if restarted else "at the open (held overnight)")
     else:
         market.minute = 1
+    missing: dict[str, int] = {}
     while True:
+        BEAT["t"] = time.monotonic()
         minute = int((market.now() - dt.datetime.combine(market.today, dt.time(9, 30), NY)).total_seconds() // 60)
         if minute > ORB.FLAT + 1:
             break
@@ -655,14 +740,23 @@ def main() -> int:
                             if c not in (st.get("sold") or {}).values():
                                 hold[c] = hold.get(c, 0) + st["qty"]
             f = open_file()
-            for c in (json.loads(f.read_text()) if f.exists() else {}):
-                hold.setdefault(c, (market.held(c) or (0,))[0])
+            mine = json.loads(f.read_text()) if f.exists() else {}
+            for c, info in mine.items():                     # reconcile: anything we hold that the broker doesn't
+                try:
+                    have = market.held(c)
+                except Exception:
+                    have = True                               # can't tell right now: don't act on it
+                missing[c] = 0 if have else missing.get(c, 0) + 1
+                if missing[c] >= 3:                           # gone for 3 minutes: closed without us
+                    settle_outside(market, runners, c, info, "closed outside the proving ground (risk guard or broker)", log)
+                    missing.pop(c, None); continue
+                hold.setdefault(c, (have or (0,))[0] if have is not True else 0)
             BR.write_claims("proving", hold)
         busy = any(st.get("phase") == "in a trade" for r in runners.values() for st in r.state.values())
         write_status(reg, runners, "in a trade" if busy else "watching", log, market)
         market.wait_next_minute()
     if not args.replay:
-        close_leftovers(market, log, "after the session (should have closed by 3:45)")
+        close_leftovers(market, log, "after the session (should have closed by 3:45)", runners)
         BR.write_claims("proving", {})
     lifecycle(reg, read_trades())
     write_status(reg, runners, "session over", log, market)
