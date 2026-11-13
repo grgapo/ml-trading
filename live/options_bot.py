@@ -49,6 +49,10 @@ PER_TRADE = float(os.environ.get("OPT_PER_TRADE", str(DAILY_BUDGET / MAX_TRADES)
 STOP_LOSS = float(os.environ.get("OPT_STOP_LOSS", "-0.35"))     # -35% of premium
 TAKE_PROFIT = float(os.environ.get("OPT_TAKE_PROFIT", "0.50"))  # +50% of premium
 MAX_HOLD_MIN = int(os.environ.get("OPT_MAX_HOLD_MIN", "60"))
+# "Learning" trades: on days the recipe would sit out (wrong volatility / VIX / event day), trade anyway at
+# 1 contract, logged to options_learning.csv so they never count toward the go-live record, the scorecard or
+# the champion check. Never on the IBKR instance.
+LEARN_DAYS = os.environ.get("OPT_LEARN_DAYS") == "1" and os.environ.get("OPT_BROKER", "alpaca") != "ibkr"
 CHECK_EVERY_S = int(os.environ.get("OPT_CHECK_EVERY_S", "60"))
 FIRST_ENTRY = os.environ.get("OPT_FIRST_ENTRY", "09:45")         # skip the opening chaos
 LAST_ENTRY = os.environ.get("OPT_LAST_ENTRY", "15:00")
@@ -294,21 +298,28 @@ class ModelAgent:
             return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: only "
                     f"{int(row['conf_bull'] if direction > 0 else row['conf_bear'])} setup(s) agree, needs {st['confluence']}",
                     "features": None, "preds": None}
+        learn_why = None
         if not vol_ok(row["vol_ratio"], st.get("vol_filter", "off")):
-            return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: "
-                    f"{st.get('vol_filter')} days only (vol ratio {row['vol_ratio']:.2f})",
-                    "features": None, "preds": None}
+            why = f"{st.get('vol_filter')} days only (vol ratio {row['vol_ratio']:.2f})"
+            if not LEARN_DAYS:
+                return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: " + why,
+                        "features": None, "preds": None}
+            learn_why = learn_why or why
         from strategy import event_ok, vix_ok
         ev_today = float(((row.get("fomc_day", 0) or 0) + (row.get("cpi_day", 0) or 0) + (row.get("jobs_day", 0) or 0)) > 0)
         if not event_ok(ev_today, st.get("event_filter", "off")):
-            return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: "
-                    f"{'no trading on event days' if st.get('event_filter') == 'skip' else 'event days only'}",
-                    "features": None, "preds": None}
+            why = 'no trading on event days' if st.get('event_filter') == 'skip' else 'event days only'
+            if not LEARN_DAYS:
+                return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: " + why,
+                        "features": None, "preds": None}
+            learn_why = learn_why or why
         if not vix_ok(row.get("vix_rel", float("nan")), st.get("vix_filter", "off")):
-            return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: "
-                    f"VIX {'below' if st.get('vix_filter') == 'low' else 'above'} usual only "
-                    f"(now {100 * (row.get('vix_rel') or 0):+.0f}% vs its 1-year median)",
-                    "features": None, "preds": None}
+            why = (f"VIX {'below' if st.get('vix_filter') == 'low' else 'above'} usual only "
+                   f"(now {100 * (row.get('vix_rel') or 0):+.0f}% vs its 1-year median)")
+            if not LEARN_DAYS:
+                return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: " + why,
+                        "features": None, "preds": None}
+            learn_why = learn_why or why
         options = [a + 1 for a in allowed_actions(direction, st["dte"])]   # -> ACTIONS indices
         fired = [SIGNAL_NAMES[sg] for sg in st["signals"] if row[sg] != 0]
         label = f"{', '.join(fired)} {'▲' if direction > 0 else '▼'} · "
@@ -330,6 +341,8 @@ class ModelAgent:
                 if a and self.q_low is not None and preds[a - 1] + self.q_low[a - 1] < 0:
                     a = 0                                  # not confident enough it won't lose
                     label += "not confident enough · "
+        if learn_why:                                   # off-recipe day: a 1-contract learning trade
+            explored, label = "learn", f"LEARNING (recipe: {learn_why}) · " + label
         return {"action": a, "explored": explored, "situation": f"{symbol} · {label}" + describe(row),
                 "features": [round(x, 8) for x in f.tolist()],
                 "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in options} if preds else None,
@@ -680,7 +693,7 @@ def write_status(**data) -> None:
 
 
 def log_trade(row: dict) -> None:
-    path = STATE_DIR / "options_trades.csv"
+    path = STATE_DIR / ("options_learning.csv" if row.get("explored") == "learn" else "options_trades.csv")
     new = not path.exists()
     with path.open("a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["date", "opened", "closed", "symbol", "contract", "action",
@@ -841,6 +854,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                             cap = BR.size_cap(BOT_ID) if live else None
                             if cap is not None:
                                 qty = min(qty, cap)          # new order code: minimum size on its first live day
+                            if d.get("explored") == "learn":
+                                qty = min(qty, 1)            # learning trade: 1 contract only
                             sent = False
                             if qty >= 1:
                                 try:

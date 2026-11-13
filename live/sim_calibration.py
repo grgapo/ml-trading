@@ -121,6 +121,8 @@ def summarize(rows: list[dict]) -> dict:
 def main() -> int:
     path = STATE_DIR / "options_trades.csv"
     trades = [r for r in csv.DictReader(path.open())] if path.exists() else []
+    lp = STATE_DIR / "options_learning.csv"            # 1-contract learning trades: real fills too
+    trades += list(csv.DictReader(lp.open())) if lp.exists() else []
     trades = [t for t in trades if t.get("contract") and t.get("entry") and t.get("closed")]
     cache: dict = {}
     current = evaluate(trades, IV_MULT, SPREAD, cache)

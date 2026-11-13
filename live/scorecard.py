@@ -135,6 +135,11 @@ def daily_pnl(days: int = 60) -> dict:
         for r in trades(PS / b, None):
             if r["date"] >= since:
                 out.setdefault(b, {}); out[b][r["date"]] = out[b].get(r["date"], 0.0) + float(r["pl_usd"])
+    lf = PS / "options-qqq" / "options_learning.csv"        # QQQ learning trades: own line, never in the score
+    if lf.exists():
+        for r in csv.DictReader(lf.open()):
+            if r.get("date", "") >= since and r.get("pl_usd"):
+                k = "options-qqq learning"; out.setdefault(k, {}); out[k][r["date"]] = out[k].get(r["date"], 0.0) + float(r["pl_usd"])
     f = PS / "proving" / "trades.csv"
     if f.exists():
         for r in csv.DictReader(f.open()):
