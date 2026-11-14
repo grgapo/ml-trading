@@ -34,11 +34,38 @@ from options_pretrain import (DAILY_BUDGET, DATA_DIR, EMBARGO_DAYS, MODEL_PATH, 
 import board_tools as BT  # noqa: E402
 from strategy import SIGNAL_SETS, SPACE, VOL_SPLIT, WINDOWS, allowed_actions, dataset_key, describe, needs_live_support  # noqa: E402
 
-SEARCH_DIR = STATE_DIR / "search"
+# Day-type lanes (OPT_LANE): a separate search that only tries recipes for ONE kind of day, judged against its own
+# lane champion (not the main one), with its own results under search/lane-<name>/. A lane never touches the bot:
+# a recipe that passes the blind test is saved as the lane champion and announced, then added to the bot's playbook.
+LANES = {"calm": {"vol_filter": "calm"},
+         "volatile-vixlow": {"vol_filter": "volatile", "vix_filter": "low"},
+         "volatile-vixhigh": {"vol_filter": "volatile", "vix_filter": "high"},
+         "calm-vixhigh": {"vol_filter": "calm", "vix_filter": "high"}}
+LANE = os.environ.get("OPT_LANE", "").strip()
+if LANE and LANE not in LANES:
+    raise SystemExit(f"unknown OPT_LANE {LANE!r}; choose from {', '.join(LANES)}")
+MAIN_SEARCH_DIR = STATE_DIR / "search"
+SEARCH_DIR = MAIN_SEARCH_DIR / f"lane-{LANE}" if LANE else MAIN_SEARCH_DIR
 CACHE_DIR = DATA_DIR.parent / "search_cache"               # + one subfolder per symbol set (per bot)
 LEADERBOARD = SEARCH_DIR / "leaderboard.json"
 CHAMPION = SEARCH_DIR / "champion.json"
-STATUS_PATH = STATE_DIR / "search.json"
+STATUS_PATH = STATE_DIR / (f"search-lane-{LANE}.json" if LANE else "search.json")
+
+
+def global_looks() -> int:
+    """Every blind look ever taken at this bot's locked period: main search + every lane + one-off tests.
+    They all look at the same months, so they all share one rising bar."""
+    n = 0
+    for c in [MAIN_SEARCH_DIR / "champion.json"] + sorted(MAIN_SEARCH_DIR.glob("lane-*/champion.json")):
+        try:
+            n += int(json.loads(c.read_text()).get("holdout_checks") or 0)
+        except Exception:
+            pass
+    try:
+        n += len(json.loads((MAIN_SEARCH_DIR / "calm_lane.json").read_text()).get("looks", []))
+    except Exception:
+        pass
+    return n
 HOLDOUT_MONTHS = int(os.environ.get("OPT_HOLDOUT_MONTHS", "6"))
 MIN_TRAIN_MONTHS = 6
 MIN_TRADES = int(os.environ.get("OPT_SEARCH_MIN_TRADES", "40"))
@@ -303,6 +330,10 @@ def sample(rng: random.Random) -> dict:
         p["confidence"] = "off"
     if p["exit_style"] == "atr":                    # the quick-exit settings don't apply
         p["stop_loss"] = p["take_profit"] = p["max_hold"] = None
+    if LANE:
+        p.update(LANES[LANE])                       # this lane's kind of day only
+        if p.get("day_filter") not in (None, "off"):
+            p["day_filter"] = "off"
     return p
 
 
@@ -323,6 +354,8 @@ def neighbors(p: dict, rng: random.Random) -> list[dict]:
     """Variations one step away on a single setting (the next value up or down in its list)."""
     out = []
     for k in NEIGHBOR_KEYS:
+        if LANE and k in LANES[LANE]:
+            continue                                     # a lane's neighbours stay on the lane's kind of day
         vals = SPACE.get(k)
         if not vals or p.get(k) is None or p.get(k) not in vals:
             continue                                     # e.g. quick-exit settings under ATR exits
@@ -469,7 +502,14 @@ def main() -> int:
         if deadline <= now:
             deadline += dt.timedelta(days=1)
 
+    SEARCH_DIR.mkdir(parents=True, exist_ok=True)       # a new lane has no folder yet
     board = load_json(LEADERBOARD, [])
+    if LANE and not board:                              # first lane night: reuse what the main search already tested
+        want = LANES[LANE]
+        board = [e for e in load_json(MAIN_SEARCH_DIR / "leaderboard.json", [])
+                 if all(e["params"].get(k) == v for k, v in want.items())
+                 and e["params"].get("day_filter") in (None, "off")]
+        print(f"lane {LANE}: seeded with {len(board):,} variations the main search already tested", flush=True)
     champion = load_json(CHAMPION, {"params": None, "desc": "none yet (bot keeps its current model)",
                                     "search_pnl": 0.0, "holdout_pnl": 0.0, "holdout_checks": 0})
     tried = {key_of(e["params"]) for e in board}
@@ -505,8 +545,9 @@ def main() -> int:
             sim_calibration.main()
         except Exception as exc:
             print(f"simulator check skipped: {exc}")
-        status("checking the live champion")
-        monitor_champion(champion, raw, memo)
+        if not LANE:                                    # lanes don't run the bot, so there is no live record to check
+            status("checking the live champion")
+            monitor_champion(champion, raw, memo)
         explore_until = deadline - dt.timedelta(minutes=20 + ROBUST_RESERVE_MIN) if deadline else None
         last_save = time.time()                         # results file is big: save once a minute, not every variation
         while tonight < args.trials and (explore_until is None or dt.datetime.now(NY) < explore_until):
@@ -571,7 +612,8 @@ def main() -> int:
             best["holdout"] = run_folds(data, best["params"], folds, keep_trades=True)
             best["holdout_period"] = [h0, h1]
             champion["holdout_checks"] = champion.get("holdout_checks", 0) + 1
-            ok_bar, why = convincing(best["holdout"], champion["holdout_checks"])
+            save_json(CHAMPION, champion)                   # count the look before anything else can fail
+            ok_bar, why = convincing(best["holdout"], global_looks())
             best["holdout"]["verdict"] = ("passed: " if ok_bar else "not convincing: ") + why
             _written = BT.write_all(SEARCH_DIR, board, _written)
             # a champion promoted under the old, looser bar doesn't block a convincing newcomer
@@ -585,6 +627,14 @@ def main() -> int:
                     notify(f"A variation passed the locked test but the live bot needs {', '.join(missing)} before it can "
                            f"trade it: {best['desc']} (holdout {best['holdout']['pnl']:+,.0f} over {best['holdout']['trades']} trades). "
                            f"Ask Claude to add live support.")
+                elif LANE:                                  # lane: record it, announce it, leave the bot alone
+                    champion.update(params=best["params"], desc=best["desc"], search_pnl=best["search"]["pnl"],
+                                    holdout_pnl=best["holdout"]["pnl"], holdout_trades=best["holdout"]["trades"],
+                                    holdout_mean=best["holdout"].get("mean"), holdout_t=best["holdout"].get("t"),
+                                    lane=LANE, promoted=dt.datetime.now(NY).isoformat(timespec="seconds"))
+                    notify(f"Lane '{LANE}' found a recipe that passed the blind test: {best['desc']} "
+                           f"(holdout {best['holdout']['pnl']:+,.0f} over {best['holdout']['trades']} trades). "
+                           f"Ask Claude to add it to the bot's playbook.")
                 else:
                     status("promoting a new champion")
                     promote(best, raw, memo, champion)
