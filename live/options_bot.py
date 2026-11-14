@@ -357,7 +357,8 @@ class ModelAgent:
                 "features": [round(x, 8) for x in f.tolist()],
                 "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in options} if preds else None,
                 "atr": float(row["atr5"]) if "atr5" in row and row["atr5"] == row["atr5"] else None,
-                "u_close": float(row["close"])}
+                "u_close": float(row["close"]),
+                "vol_ratio": float(row["vol_ratio"]) if row.get("vol_ratio") == row.get("vol_ratio") else None}
 
     def learn_trade(self, trade: dict, reward: float, date: str) -> None:
         new = not self.live_path.exists()
@@ -868,6 +869,14 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                                 qty = min(qty, cap)          # new order code: minimum size on its first live day
                             if d.get("explored") == "learn":
                                 qty = min(qty, 1)            # learning trade: 1 contract only
+                            try:                             # shadow: what the go-live sizing rule would trade
+                                import sizing as SZ
+                                day["last_decision"]["live_size"] = (
+                                    "learning trade: 1 contract" if d.get("explored") == "learn" else
+                                    SZ.contracts(BOT_ID, price, SZ.SHADOW_EQUITY, max(qty, 1), d.get("vol_ratio"))[1]
+                                ) if price else None
+                            except Exception as exc:
+                                day["last_decision"]["live_size"] = f"sizing unavailable ({type(exc).__name__})"
                             sent = False
                             if qty >= 1:
                                 try:
