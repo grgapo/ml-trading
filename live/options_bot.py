@@ -53,6 +53,9 @@ MAX_HOLD_MIN = int(os.environ.get("OPT_MAX_HOLD_MIN", "60"))
 # 1 contract, logged to options_learning.csv so they never count toward the go-live record, the scorecard or
 # the champion check. Never on the IBKR instance.
 LEARN_DAYS = os.environ.get("OPT_LEARN_DAYS") == "1" and os.environ.get("OPT_BROKER", "alpaca") != "ibkr"
+# Backstop: no trade yet by this New York time -> the next signal becomes a 1-contract learning trade,
+# even if it is outside the recipe's window / agreement rule or the model says skip. One per day.
+BACKSTOP_AT = os.environ.get("OPT_BACKSTOP_AT", "13:30")
 CHECK_EVERY_S = int(os.environ.get("OPT_CHECK_EVERY_S", "60"))
 FIRST_ENTRY = os.environ.get("OPT_FIRST_ENTRY", "09:45")         # skip the opening chaos
 LAST_ENTRY = os.environ.get("OPT_LAST_ENTRY", "15:00")
@@ -244,6 +247,8 @@ class ModelAgent:
         else:
             best = max(allowed, key=lambda x: preds[x - 1])
             a = best if preds[best - 1] >= self.min_edge else 0
+            if a == 0 and getattr(self, "backstop", False):
+                a, explored, label = best, "learn", f"LEARNING (no trade by {BACKSTOP_AT}) · " + label
         return {"action": a, "explored": explored, "situation": f"{symbol} · {label}" + describe(row),
                 "features": [round(x, 8) for x in f.tolist()],
                 "preds": {ACTIONS[i]: round(preds[i - 1], 4) for i in allowed}}
@@ -288,17 +293,20 @@ class ModelAgent:
         direction = int(direction_from(row, st["signals"]))
         lo, hi = WINDOWS[st["window"]]
         key = (symbol, str(row["ts"]))
-        if direction == 0 or key in self.seen or not (lo <= row["minutes_since_open"] <= hi):
+        late = getattr(self, "backstop", False)
+        if direction == 0 or key in self.seen or not (late or lo <= row["minutes_since_open"] <= hi):
             return None
         self.seen.add(key)
+        learn_why = None if lo <= row["minutes_since_open"] <= hi else f"no trade by {BACKSTOP_AT}"
         for k, v in self._vol_today(symbol, now, float(row["close"])).items():
             row[k] = v
         from strategy import confluence_ok, vol_ok
-        if not confluence_ok(direction, row.get("conf_bull", 1), row.get("conf_bear", 1), st.get("confluence")):
+        if not confluence_ok(direction, row.get("conf_bull", 1), row.get("conf_bear", 1), st.get("confluence")) and late:
+            learn_why = learn_why or f"no trade by {BACKSTOP_AT}"
+        elif not confluence_ok(direction, row.get("conf_bull", 1), row.get("conf_bear", 1), st.get("confluence")):
             return {"action": 0, "explored": False, "situation": f"{symbol} · signal skipped: only "
                     f"{int(row['conf_bull'] if direction > 0 else row['conf_bear'])} setup(s) agree, needs {st['confluence']}",
                     "features": None, "preds": None}
-        learn_why = None
         if not vol_ok(row["vol_ratio"], st.get("vol_filter", "off")):
             why = f"{st.get('vol_filter')} days only (vol ratio {row['vol_ratio']:.2f})"
             if not LEARN_DAYS:
@@ -341,6 +349,8 @@ class ModelAgent:
                 if a and self.q_low is not None and preds[a - 1] + self.q_low[a - 1] < 0:
                     a = 0                                  # not confident enough it won't lose
                     label += "not confident enough · "
+        if a == 0 and late and options:
+            a, learn_why = options[0], learn_why or f"no trade by {BACKSTOP_AT}"
         if learn_why:                                   # off-recipe day: a 1-contract learning trade
             explored, label = "learn", f"LEARNING (recipe: {learn_why}) · " + label
         return {"action": a, "explored": explored, "situation": f"{symbol} · {label}" + describe(row),
@@ -834,6 +844,8 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                         candidates = [SYMBOLS[turn % len(SYMBOLS)]]
                         turn += 1
                     d = None
+                    agent.backstop = (LEARN_DAYS and day["trades"] == 0 and not day["open"]
+                                      and now.strftime("%H:%M") >= BACKSTOP_AT)
                     for symbol in candidates:
                         bars = market.bars(symbol)
                         d = agent.decide(symbol, bars, now, explore) if len(bars) else None
