@@ -47,6 +47,10 @@ MAX_TRADES = int(os.environ.get("OPT_MAX_TRADES", "5"))
 WIN_TARGET = int(os.environ.get("OPT_WIN_TARGET", "3"))
 PER_TRADE = float(os.environ.get("OPT_PER_TRADE", str(DAILY_BUDGET / MAX_TRADES)))
 STOP_LOSS = float(os.environ.get("OPT_STOP_LOSS", "-0.35"))     # -35% of premium
+# Bad-day limits (off unless set): size each trade so hitting its stop loses at most RISK_PER_TRADE_PCT of the daily
+# budget, and stop for the day once the day's P&L reaches -DAY_STOP_PCT of the budget. 0 = off.
+RISK_PER_TRADE_PCT = float(os.environ.get("OPT_RISK_PER_TRADE_PCT", "0"))
+DAY_STOP_PCT = float(os.environ.get("OPT_DAY_STOP_PCT", "0"))
 TAKE_PROFIT = float(os.environ.get("OPT_TAKE_PROFIT", "0.50"))  # +50% of premium
 MAX_HOLD_MIN = int(os.environ.get("OPT_MAX_HOLD_MIN", "60"))
 # "Learning" trades: on days the recipe would sit out (wrong volatility / VIX / event day), trade anyway at
@@ -818,7 +822,9 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                                               "action": t["action"], "pl_usd": round(pos["pl"], 2),
                                               "plpc": round(pos["plpc"], 4), "reason": reason}
                         day["open"] = None
-                        if day["wins"] >= WIN_TARGET:
+                        if DAY_STOP_PCT > 0 and day["pl_usd"] <= -DAY_STOP_PCT * DAILY_BUDGET:
+                            day["stopped"] = f"daily loss stop ({day['pl_usd']:+,.0f}, limit -{DAY_STOP_PCT:.0%})"
+                        elif day["wins"] >= WIN_TARGET:
                             day["stopped"] = f"hit {WIN_TARGET} winners"
                         elif day["trades"] >= MAX_TRADES:
                             day["stopped"] = f"used all {MAX_TRADES} trades"
@@ -869,6 +875,9 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                                 qty = min(qty, cap)          # new order code: minimum size on its first live day
                             if d.get("explored") == "learn":
                                 qty = min(qty, 1)            # learning trade: 1 contract only
+                            if RISK_PER_TRADE_PCT > 0 and price:   # a full stop may cost at most this share of the budget
+                                sl = abs(float((getattr(agent, "exits", None) or {}).get("sl") or STOP_LOSS))
+                                qty = min(qty, max(1, int(RISK_PER_TRADE_PCT * DAILY_BUDGET // (price * 100 * max(sl, 0.2)))))
                             try:                             # shadow: what the go-live sizing rule would trade
                                 import sizing as SZ
                                 day["last_decision"]["live_size"] = (
