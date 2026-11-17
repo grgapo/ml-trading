@@ -51,6 +51,8 @@ STOP_LOSS = float(os.environ.get("OPT_STOP_LOSS", "-0.35"))     # -35% of premiu
 # budget, and stop for the day once the day's P&L reaches -DAY_STOP_PCT of the budget. 0 = off.
 RISK_PER_TRADE_PCT = float(os.environ.get("OPT_RISK_PER_TRADE_PCT", "0"))
 DAY_STOP_PCT = float(os.environ.get("OPT_DAY_STOP_PCT", "0"))
+# Regime playbook (live/playbook.py): after 10:30, quarter size on a quiet first hour, full size on a strong one. 1 = on.
+PLAYBOOK = os.environ.get("OPT_PLAYBOOK") == "1"
 TAKE_PROFIT = float(os.environ.get("OPT_TAKE_PROFIT", "0.50"))  # +50% of premium
 MAX_HOLD_MIN = int(os.environ.get("OPT_MAX_HOLD_MIN", "60"))
 # "Learning" trades: on days the recipe would sit out (wrong volatility / VIX / event day), trade anyway at
@@ -878,6 +880,13 @@ def run_session(market, agent: Agent, explore: float) -> dict:
                             if RISK_PER_TRADE_PCT > 0 and price:   # a full stop may cost at most this share of the budget
                                 sl = abs(float((getattr(agent, "exits", None) or {}).get("sl") or STOP_LOSS))
                                 qty = min(qty, max(1, int(RISK_PER_TRADE_PCT * DAILY_BUDGET // (price * 100 * max(sl, 0.2)))))
+                            if PLAYBOOK and live and price and d.get("explored") != "learn":
+                                try:
+                                    import playbook as PB
+                                    qty, why = PB.size(qty, getattr(market, "stocks", None), now)
+                                except Exception as exc:     # never blocks a trade: full size if anything goes wrong
+                                    why = f"playbook unavailable ({type(exc).__name__}), full size"
+                                day["last_decision"]["playbook"] = why
                             try:                             # shadow: what the go-live sizing rule would trade
                                 import sizing as SZ
                                 day["last_decision"]["live_size"] = (

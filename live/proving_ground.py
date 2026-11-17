@@ -75,6 +75,7 @@ DEFAULT_EXPERIMENTS = [{
 MIN_TRADES, MIN_WEEKS, MAX_LOSS = 30, 8, 5000.0      # experiments are retired at -$5,000 lifetime
 EXPERIMENT_STAKE_CAP = 2000.0                            # hard cap per trade for any experiment
 DAILY_BUDGET = float(os.environ.get("PROVING_DAILY_BUDGET", "2500"))   # shared by every experiment that places orders
+PLAYBOOK = set(filter(None, os.environ.get("PROVING_PLAYBOOK", "").split(",")))   # experiment ids using live/playbook.py
 
 
 def budget_left(today) -> float:
@@ -456,6 +457,14 @@ class OrbCalm:
                     cap = BR.size_cap("proving")
                     if cap is not None:
                         qty = min(qty, cap)                   # new order code: minimum size until it has proven itself
+                    if self.exp["id"] in PLAYBOOK and qty > 0:   # regime playbook: quarter size after 10:30 on quiet days
+                        try:
+                            import playbook as PB
+                            qty, why = PB.size(qty, getattr(self.mk, "stocks", None), self.mk.now())
+                        except Exception as exc:
+                            why = f"playbook unavailable ({type(exc).__name__}), full size"
+                        st["playbook"] = why
+                        events.append({"sym": sym, "text": f"{sym}: {why}"})
                     if self.shadow:                           # record at the live ask; nothing is sent to the broker
                         got = (ask, qty) if qty > 0 else None
                     else:
